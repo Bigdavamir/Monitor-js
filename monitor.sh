@@ -2,155 +2,60 @@
 # Exit immediately if a command exits with a non-zero status.
 set -e
 
-# --- Script for Advanced JS File Monitoring ---
+# --- Worker Script for Parallel JS Scanning ---
+# This script is designed to be run by a parallel job in the GitHub workflow.
+# It reads a list of subdomains from stdin, scans them, and downloads JS files.
 
-# 1. Input Validation: Ensure a target domain is provided.
+# 1. Input Validation: Ensure a base target domain is provided for directory structure.
 TARGET_DOMAIN="$1"
-if [ -z "$TARGET_DOMAIN" ]; then
-  echo "Error: Target domain not provided."
-  echo "Usage: ./monitor.sh <target_domain>"
+if [ -z "$TARGET_DOMAIN" ];
+  echo "Error: Base target domain not provided. This is needed for creating the output directory."
+  echo "Usage: ./monitor.sh <base_target_domain>"
   exit 1
 fi
 
-# 2. Secrets Validation: Ensure the session cookie is available.
-if [ -z "$SESSION_COOKIE" ]; then
-  echo "Error: The SESSION_COOKIE environment variable is not set."
-  exit 1
-fi
-
-echo "✅ Starting JS file scan for: $TARGET_DOMAIN"
-
-# 3. Katana Scan: Discover JS files using a deep and fast scan.
+# 2. Prepare Headers for Scanning Tools (with optional cookie)
 USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
-COOKIE_HEADER="Cookie: $SESSION_COOKIE"
-TEMP_JS_URLS="discovered_js_urls.txt"
+WGET_ARGS="--user-agent=$USER_AGENT --quiet --no-check-certificate"
+# Use an array for Katana headers for cleaner handling
+KATANA_HEADER_ARGS=("-H" "User-Agent: $USER_AGENT")
 
+if [ -n "$SESSION_COOKIE" ]; then
+  echo "✅ Session cookie found. Performing authenticated scan."
+  WGET_ARGS="$WGET_ARGS --header=Cookie:$SESSION_COOKIE"
+  KATANA_HEADER_ARGS+=("-H" "Cookie: $SESSION_COOKIE")
+else
+  echo "ℹ️ No session cookie provided. Performing unauthenticated scan."
+fi
 
-echo "🚀 Running Katana for deep JS discovery..."
-katana -u "https://$TARGET_DOMAIN" -d 10 -c 50 -jc -silent -H "$COOKIE_HEADER" -H "User-Agent: $USER_AGENT" -o $TEMP_JS_URLS
-# 3. Discover JavaScript files using Katana.
-echo "Running Katana to discover JavaScript files..."
-katana -u "https://$TARGET_DOMAIN" -d 5 -jc -silent -H "$COOKIE_HEADER" -H "User-Agent: $USER_AGENT" -o discovered_js_urls.txt
+# 3. Create Directory and Temporary File
+# All JS files will be stored under a single directory for the main target.
+# This script instance will place its findings in a directory named with its runner ID.
+# The final job will consolidate these.
+OUTPUT_DIR="js_files_temp/runner_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${MATRIX_ID:-0}"
+mkdir -p "$OUTPUT_DIR"
+TEMP_JS_URLS=$(mktemp)
 
-echo "🔎 Katana scan complete. Found $(wc -l < $TEMP_JS_URLS) potential JS files."
+# 4. Process Subdomains from Standard Input
+echo "🚀 Starting scan on assigned subdomains..."
+while read -r subdomain; do
+  if [ -z "$subdomain" ]; then continue; fi
+  echo "   - Scanning: https://$subdomain"
+  katana -u "https://$subdomain" -d 5 -c 20 -jc -silent "${KATANA_HEADER_ARGS[@]}" >> "$TEMP_JS_URLS" || echo "⚠️ Katana failed for $subdomain, continuing..."
+done
 
-# 4. File Downloading: Download discovered files with safe filenames.
-JS_DIR="js_files/$TARGET_DOMAIN"
-mkdir -p "$JS_DIR"
+echo "🔎 Scan complete. Found $(wc -l < "$TEMP_JS_URLS") total JS file URLs (pre-unification)."
 
-echo "💾 Downloading files..."
-while IFS= read -r url; do
-  # Generate a safe filename from the URL to prevent path traversal.
-  # Example: https://example.com/js/app.js -> example.com_js_app.js
-  safe_filename=$(echo "$url" | sed -e 's|https\?://||' -e 's|/|_|g' -e 's|?.*||')
+# 5. Download Unique JavaScript Files
+# Deduplicate URLs before downloading
+sort -u "$TEMP_JS_URLS" | while IFS= read -r url; do
+  # Generate a safe, unique filename from the URL
+  safe_filename=$(echo "$url" | sed -e 's|https\?://||' -e 's|/|_|g' -e 's|?.*||' -e 's|&.*||' -e 's|=.*||' | tr -c 'a-zA-Z0-9._-' '_')
+  if [ -z "$safe_filename" ]; then continue; fi
 
-  # Download the file using the safe filename.
-  wget --header="$COOKIE_HEADER" --user-agent="$USER_AGENT" --quiet -O "$JS_DIR/$safe_filename" "$url" || echo "⚠️ Warning: Could not download $url"
-done < "$TEMP_JS_URLS"
+  # Download the file
+  wget $WGET_ARGS -O "$OUTPUT_DIR/$safe_filename.js" "$url" || echo "⚠️ Could not download: $url"
+done
 
 rm "$TEMP_JS_URLS"
-echo "✅ File download process complete."
-
-# 5. Git Change Detection & Commit
-echo "🔄 Checking for file changes..."
-git config --global user.name "GitHub Action Bot"
-git config --global user.email "action-bot@github.com"
-
-# Stage all files in the target's directory.
-git add -A "$JS_DIR/"
-
-# Check if there are any staged changes.
-
-echo "Downloading files..."
-while IFS= read -r url; do
-  # --- IMPROVEMENT ---
-  # Generate a safe and unique filename from the URL to prevent collisions.
-  # Example: https://cdn.example.com/js/app.js -> cdn.example.com_js_app.js
-  safe_filename=$(echo "$url" | sed -e 's|https\?://||' -e 's|/|_|g' -e 's|?.*$||')
-  
-  # Ensure the filename ends with .js if it's a valid JS file
-  if [[ ! "$safe_filename" == *.js ]]; then
-    safe_filename="${safe_filename}.js"
-  fi
-
-  # Use wget to download the file with the generated safe filename.
-  echo "  -> Downloading $url"
-  wget --header="$COOKIE_HEADER" --user-agent="$USER_AGENT" -O "$JS_FILES_DIR/$TARGET_DOMAIN/$safe_filename" -q --no-check-certificate "$url" || echo "Warning: Could not download $url"
-done < discovered_js_urls.txt
-
-echo "File download process complete."
-# Clean up the temporary URL list file.
-rm discovered_js_urls.txt
-
-# 5. Track changes in the Git repository.
-echo "Checking for changes and committing to Git..."
-
-# Configure Git user
-git config --global user.name "GitHub Action"
-git config --global user.email "action@github.com"
-
-# Add all changes in the JS files directory.
-git add -A "$JS_FILES_DIR/"
-
-# Check if there are any changes to commit.
-
-if git diff --staged --quiet; then
-  echo "✅ No changes detected in JavaScript files for $TARGET_DOMAIN. All clear!"
-else
-  echo "🚨 Changes detected! Committing and pushing updates..."
-
-  # Commit the changes.
-  COMMIT_MESSAGE="[JS Scan] Update files for $TARGET_DOMAIN"
-  git commit -m "$COMMIT_MESSAGE"
-
-  # Pull latest changes from remote before pushing to avoid conflicts.
-  git pull origin main --rebase
-
-  # Push the commit.
-  git push origin main
-
-  echo "✅ Changes pushed to the repository."
-
-  # 6. Send Discord Notification
-  if [ -z "$DISCORD_WEBHOOK_URL" ]; then
-    echo "⚠️ Warning: DISCORD_WEBHOOK_URL is not set. Skipping notification."
-  else
-    echo "📢 Sending Discord notification..."
-    COMMIT_HASH=$(git rev-parse HEAD)
-    COMMIT_URL="https://github.com/$GITHUB_REPOSITORY/commit/$COMMIT_HASH"
-    TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
-
-    # Construct a rich embed payload for Discord.
-    JSON_PAYLOAD=$(printf '{
-      "embeds": [{
-        "title": "🚨 New JavaScript Changes Detected!",
-        "color": 16711680,
-        "fields": [
-          {
-            "name": "Target Domain",
-            "value": "%s",
-            "inline": true
-          },
-          {
-            "name": "Commit Link",
-            "value": "[View Commit](%s)",
-            "inline": true
-          }
-        ],
-        "footer": {
-          "text": "Scan completed"
-        },
-        "timestamp": "%s"
-      }]
-    }' "$TARGET_DOMAIN" "$COMMIT_URL" "$TIMESTAMP")
-
-    # Send the notification via curl.
-    curl -H "Content-Type: application/json" -X POST -d "$JSON_PAYLOAD" "$DISCORD_WEBHOOK_URL"
-    echo "✅ Notification sent."
-  fi
-fi
-
-echo "✅ Monitoring script finished successfully."
-
-echo "Monitoring script finished successfully."
-
+echo "✅ Download process complete for this runner. Output at $OUTPUT_DIR"

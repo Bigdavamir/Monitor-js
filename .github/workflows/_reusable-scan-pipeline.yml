@@ -18,14 +18,12 @@ on:
         required: false
 
 jobs:
-  # Job 1: Discover all subdomains for the target domain
-  discover:
+  # Job 1: Discover all JS URLs from live and historical sources
+  discover_urls:
     runs-on: ubuntu-latest
-    # This associates the job with the specified environment, giving it access
-    # to environment-specific variables (like TARGET_DOMAIN) and secrets.
     environment: ${{ inputs.environment_name }}
     outputs:
-      subdomain_count: ${{ steps.split.outputs.count }}
+      url_chunks_count: ${{ steps.split.outputs.count }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -38,35 +36,59 @@ jobs:
       - name: Install Discovery Tools
         run: |
           go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install -v github.com/projectdiscovery/katana/cmd/katana@latest
+          go install -v github.com/lc/gau/v2/cmd/gau@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
-      - name: Discover Subdomains
+      - name: Run Comprehensive Discovery
         id: discover
+        env:
+          SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
         run: |
-          # The TARGET_DOMAIN is securely retrieved from the environment's variables
-          echo "🔍 Discovering subdomains for ${{ vars.TARGET_DOMAIN }}..."
-          subfinder -d ${{ vars.TARGET_DOMAIN }} -silent -o subdomains.txt
-          echo "✅ Found $(wc -l < subdomains.txt) subdomains."
+          TARGET_DOMAIN="${{ vars.TARGET_DOMAIN }}"
+          echo "🔍 Discovering assets for $TARGET_DOMAIN..."
 
-      - name: Split subdomains for parallel processing
+          # Prepare Katana headers. User-Agent is generic, cookie is optional.
+          KATANA_HEADER_ARGS=("-H" "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36")
+          if [ -n "$SESSION_COOKIE" ]; then
+            KATANA_HEADER_ARGS+=("-H" "Cookie: $SESSION_COOKIE")
+          fi
+
+          # Step 1: Find live subdomains
+          subfinder -d $TARGET_DOMAIN -silent -o subdomains.txt
+          echo "Found $(wc -l < subdomains.txt) live subdomains."
+
+          # Step 2: Actively crawl live subdomains for JS files
+          katana -list subdomains.txt -jc -silent -d 5 -c 20 "${KATANA_HEADER_ARGS[@]}" -o katana-js.txt || echo "Katana finished with some errors, continuing..."
+          echo "Found $(wc -l < katana-js.txt) JS files from active crawling."
+
+          # Step 3: Find historical JS files from wayback machines
+          gau --threads 5 --subs $TARGET_DOMAIN | grep -iE '\.js$' | sort -u > gau-js.txt
+          echo "Found $(wc -l < gau-js.txt) JS files from historical archives."
+
+          # Step 4: Combine, unify, and filter results
+          cat katana-js.txt gau-js.txt | sort -u > all_js_urls.txt
+          echo "✅ Total unique JS URLs found: $(wc -l < all_js_urls.txt)"
+
+      - name: Split JS URLs for parallel processing
         id: split
         run: |
-          mkdir -p subdomain_chunks
-          # Split the subdomains into 20 chunks for the matrix job
-          split -d -n l/20 subdomains.txt subdomain_chunks/chunk_
-          count=$(ls -1q subdomain_chunks/ | wc -l)
+          mkdir -p url_chunks
+          # Split the JS URLs into 20 chunks for the matrix job
+          split -d -n l/20 all_js_urls.txt url_chunks/chunk_
+          count=$(ls -1q url_chunks/ | wc -l)
           echo "count=$count" >> $GITHUB_OUTPUT
-          echo "✅ Divided subdomains into $count chunks."
+          echo "✅ Divided JS URLs into $count chunks for parallel download."
 
-      - name: Upload Subdomain Chunks
+      - name: Upload URL Chunks
         uses: actions/upload-artifact@v4
         with:
-          name: subdomain-chunks-${{ inputs.environment_name }}-${{ github.run_id }}
-          path: subdomain_chunks/
+          name: url-chunks-${{ inputs.environment_name }}-${{ github.run_id }}
+          path: url_chunks/
 
-  # Job 2: Scan subdomains and download JS files in parallel
-  scan:
-    needs: discover
+  # Job 2: Download, beautify, and process JS files in parallel
+  download_and_process:
+    needs: discover_urls
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment_name }}
     strategy:
@@ -77,35 +99,31 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v4
+      - name: Set up Node.js for JS Beautifier
+        uses: actions/setup-node@v3
         with:
-          go-version: '1.21'
+          node-version: '18'
 
-      - name: Install Katana
-        run: |
-          go install github.com/projectdiscovery/katana/cmd/katana@latest
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+      - name: Install JS Beautifier
+        run: npm install -g js-beautify
 
-      - name: Download Subdomain Chunks Artifact
+      - name: Download URL Chunks Artifact
         uses: actions/download-artifact@v4
         with:
-          name: subdomain-chunks-${{ inputs.environment_name }}-${{ github.run_id }}
-          path: subdomain_chunks
+          name: url-chunks-${{ inputs.environment_name }}-${{ github.run_id }}
+          path: url_chunks
 
-      - name: Run JS Scan Worker
+      - name: Run JS Download & Process Worker
         env:
-          # The SESSION_COOKIE is securely passed from the environment's secrets
           SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
           MATRIX_ID: ${{ matrix.id }}
         run: |
           chmod +x monitor.sh
-          CHUNK_FILE="subdomain_chunks/chunk_$(printf "%02d" ${{ matrix.id }})"
+          CHUNK_FILE="url_chunks/chunk_$(printf "%02d" ${{ matrix.id }})"
           if [ -f "$CHUNK_FILE" ]; then
-            # Pass the TARGET_DOMAIN variable from the environment to the script
             cat "$CHUNK_FILE" | ./monitor.sh "${{ vars.TARGET_DOMAIN }}"
           else
-            echo "ℹ️ No chunk file for this runner, skipping."
+            echo "ℹ️ No URL chunk file for this runner, skipping."
           fi
 
       - name: Upload JS Files Artifact
@@ -116,7 +134,7 @@ jobs:
 
   # Job 3: Consolidate all results, commit changes, and notify
   consolidate:
-    needs: scan
+    needs: download_and_process
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment_name }}
     steps:

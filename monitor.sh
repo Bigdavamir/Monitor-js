@@ -25,8 +25,12 @@ USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 COOKIE_HEADER="Cookie: $SESSION_COOKIE"
 TEMP_JS_URLS="discovered_js_urls.txt"
 
+
 echo "🚀 Running Katana for deep JS discovery..."
 katana -u "https://$TARGET_DOMAIN" -d 10 -c 50 -jc -silent -H "$COOKIE_HEADER" -H "User-Agent: $USER_AGENT" -o $TEMP_JS_URLS
+# 3. Discover JavaScript files using Katana.
+echo "Running Katana to discover JavaScript files..."
+katana -u "https://$TARGET_DOMAIN" -d 5 -jc -silent -H "$COOKIE_HEADER" -H "User-Agent: $USER_AGENT" -o discovered_js_urls.txt
 
 echo "🔎 Katana scan complete. Found $(wc -l < $TEMP_JS_URLS) potential JS files."
 
@@ -56,6 +60,40 @@ git config --global user.email "action-bot@github.com"
 git add -A "$JS_DIR/"
 
 # Check if there are any staged changes.
+
+echo "Downloading files..."
+while IFS= read -r url; do
+  # --- IMPROVEMENT ---
+  # Generate a safe and unique filename from the URL to prevent collisions.
+  # Example: https://cdn.example.com/js/app.js -> cdn.example.com_js_app.js
+  safe_filename=$(echo "$url" | sed -e 's|https\?://||' -e 's|/|_|g' -e 's|?.*$||')
+  
+  # Ensure the filename ends with .js if it's a valid JS file
+  if [[ ! "$safe_filename" == *.js ]]; then
+    safe_filename="${safe_filename}.js"
+  fi
+
+  # Use wget to download the file with the generated safe filename.
+  echo "  -> Downloading $url"
+  wget --header="$COOKIE_HEADER" --user-agent="$USER_AGENT" -O "$JS_FILES_DIR/$TARGET_DOMAIN/$safe_filename" -q --no-check-certificate "$url" || echo "Warning: Could not download $url"
+done < discovered_js_urls.txt
+
+echo "File download process complete."
+# Clean up the temporary URL list file.
+rm discovered_js_urls.txt
+
+# 5. Track changes in the Git repository.
+echo "Checking for changes and committing to Git..."
+
+# Configure Git user
+git config --global user.name "GitHub Action"
+git config --global user.email "action@github.com"
+
+# Add all changes in the JS files directory.
+git add -A "$JS_FILES_DIR/"
+
+# Check if there are any changes to commit.
+
 if git diff --staged --quiet; then
   echo "✅ No changes detected in JavaScript files for $TARGET_DOMAIN. All clear!"
 else
@@ -113,3 +151,6 @@ else
 fi
 
 echo "✅ Monitoring script finished successfully."
+
+echo "Monitoring script finished successfully."
+

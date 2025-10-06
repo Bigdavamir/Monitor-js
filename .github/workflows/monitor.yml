@@ -1,41 +1,41 @@
-name: JS File Monitoring for Bug Bounty
+name: Advanced JS File Monitor
 
 on:
-  # Schedule to run automatically every 2 hours
-  schedule:
-    - cron: '0 */2 * * *'
-
-  # Allow manual triggering from the GitHub Actions UI
   workflow_dispatch:
+    inputs:
+      target_domain:
+        description: 'The target domain to scan (e.g., example.com)'
+        required: true
+        type: string
 
 jobs:
-  monitor_js_files:
+  monitor_and_notify:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout Full Git History
         uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 is crucial for accurate change detection
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.21' # Specify a recent Go version
+          go-version: '1.21'
 
       - name: Install Katana
         run: |
           echo "Installing Katana from ProjectDiscovery..."
           go install github.com/projectdiscovery/katana/cmd/katana@latest
-          # Add Go's bin directory to the PATH
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
           echo "Katana installed successfully."
 
       - name: Run JS Monitoring Script
         env:
-          # Pass the session cookie from GitHub Secrets to the script
           SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GITHUB_REPOSITORY: ${{ github.repository }} # Pass repo info for commit URL
         run: |
-          # Make the script executable
           chmod +x monitor.sh
-
-          # Execute the monitoring script
-          ./monitor.sh
+          ./monitor.sh "${{ github.event.inputs.target_domain }}"

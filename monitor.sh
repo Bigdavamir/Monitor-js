@@ -1,91 +1,115 @@
 #!/bin/bash
-
 # Exit immediately if a command exits with a non-zero status.
 set -e
 
-# == CONFIGURATION ==
-# The target domain to scan.
-# IMPORTANT: Replace "example.com" with your actual target domain.
-TARGET_DOMAIN="example.com"
+# --- Script for Advanced JS File Monitoring ---
 
-# The directory to store the downloaded JavaScript files.
-# This is relative to the script's location.
-JS_FILES_DIR="js_files"
-
-# == SCRIPT LOGIC ==
-
-# 1. Validate that the session cookie is provided.
-if [ -z "$SESSION_COOKIE" ]; then
-  echo "Error: The SESSION_COOKIE environment variable is not set."
-  echo "Please configure it in your GitHub Repository Secrets."
+# 1. Input Validation: Ensure a target domain is provided.
+TARGET_DOMAIN="$1"
+if [ -z "$TARGET_DOMAIN" ]; then
+  echo "Error: Target domain not provided."
+  echo "Usage: ./monitor.sh <target_domain>"
   exit 1
 fi
 
-echo "Starting JS file monitoring for: $TARGET_DOMAIN"
-
-# 2. Set up required headers for tools.
-# User-Agent to mimic a real browser.
-USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
-# Cookie header for authenticated scanning.
-COOKIE_HEADER="Cookie: $SESSION_COOKIE"
-
-# 3. Discover JavaScript files using Katana.
-# -u: Target URL
-# -d 5: Max crawl depth
-# -jc: Crawl for JavaScript files
-# -silent: Suppress banner and extraneous output
-# -H: Custom header for authentication
-# -o: Output file
-echo "Running Katana to discover JavaScript files..."
-katana -u "https://$TARGET_DOMAIN" -d 5 -jc -silent -H "$COOKIE_HEADER" -H "User-Agent: $USER_AGENT" -o discovered_js_urls.txt
-
-echo "Katana scan complete. Found $(wc -l < discovered_js_urls.txt) potential JS files."
-
-# 4. Download the discovered JavaScript files.
-# Create the directory if it doesn't exist.
-mkdir -p "$JS_FILES_DIR/$TARGET_DOMAIN"
-
-echo "Downloading files..."
-# Loop through each URL and download it with wget.
-while IFS= read -r url; do
-  # Use wget to download the file.
-  # --header: Pass custom headers.
-  # -P: Specify the directory prefix where files will be saved.
-  # -N: Don't re-download files unless newer than local.
-  # -q: Quiet mode.
-  # --no-check-certificate: Ignore SSL certificate issues.
-  # --trust-server-names: Use the server-provided filename.
-  wget --header="$COOKIE_HEADER" --user-agent="$USER_AGENT" -P "$JS_FILES_DIR/$TARGET_DOMAIN" -N -q --no-check-certificate --trust-server-names "$url" || echo "Warning: Could not download $url"
-done < discovered_js_urls.txt
-
-echo "File download process complete."
-rm discovered_js_urls.txt
-
-# 5. Track changes in the Git repository.
-echo "Checking for changes and committing to Git..."
-
-# Configure Git user
-git config --global user.name "GitHub Action"
-git config --global user.email "action@github.com"
-
-# Add all changes in the JS files directory.
-git add -A "$JS_FILES_DIR/"
-
-# Check if there are any changes to commit.
-if git diff --staged --quiet; then
-  echo "No changes detected in JavaScript files. Nothing to commit."
-else
-  echo "Changes detected. Committing updates."
-  COMMIT_MESSAGE="Update JS files for $TARGET_DOMAIN on $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-  git commit -m "$COMMIT_MESSAGE"
-
-  # Check if the branch exists on the remote
-  if git ls-remote --exit-code --heads origin main > /dev/null 2>&1; then
-      git pull origin main --rebase # Pull changes before pushing
-  fi
-
-  git push origin main
-  echo "Changes pushed to the repository."
+# 2. Secrets Validation: Ensure the session cookie is available.
+if [ -z "$SESSION_COOKIE" ]; then
+  echo "Error: The SESSION_COOKIE environment variable is not set."
+  exit 1
 fi
 
-echo "Monitoring script finished successfully."
+echo "✅ Starting JS file scan for: $TARGET_DOMAIN"
+
+# 3. Katana Scan: Discover JS files using a deep and fast scan.
+USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
+COOKIE_HEADER="Cookie: $SESSION_COOKIE"
+TEMP_JS_URLS="discovered_js_urls.txt"
+
+echo "🚀 Running Katana for deep JS discovery..."
+katana -u "https://$TARGET_DOMAIN" -d 10 -c 50 -jc -silent -H "$COOKIE_HEADER" -H "User-Agent: $USER_AGENT" -o $TEMP_JS_URLS
+
+echo "🔎 Katana scan complete. Found $(wc -l < $TEMP_JS_URLS) potential JS files."
+
+# 4. File Downloading: Download discovered files with safe filenames.
+JS_DIR="js_files/$TARGET_DOMAIN"
+mkdir -p "$JS_DIR"
+
+echo "💾 Downloading files..."
+while IFS= read -r url; do
+  # Generate a safe filename from the URL to prevent path traversal.
+  # Example: https://example.com/js/app.js -> example.com_js_app.js
+  safe_filename=$(echo "$url" | sed -e 's|https\?://||' -e 's|/|_|g' -e 's|?.*||')
+
+  # Download the file using the safe filename.
+  wget --header="$COOKIE_HEADER" --user-agent="$USER_AGENT" --quiet -O "$JS_DIR/$safe_filename" "$url" || echo "⚠️ Warning: Could not download $url"
+done < "$TEMP_JS_URLS"
+
+rm "$TEMP_JS_URLS"
+echo "✅ File download process complete."
+
+# 5. Git Change Detection & Commit
+echo "🔄 Checking for file changes..."
+git config --global user.name "GitHub Action Bot"
+git config --global user.email "action-bot@github.com"
+
+# Stage all files in the target's directory.
+git add -A "$JS_DIR/"
+
+# Check if there are any staged changes.
+if git diff --staged --quiet; then
+  echo "✅ No changes detected in JavaScript files for $TARGET_DOMAIN. All clear!"
+else
+  echo "🚨 Changes detected! Committing and pushing updates..."
+
+  # Commit the changes.
+  COMMIT_MESSAGE="[JS Scan] Update files for $TARGET_DOMAIN"
+  git commit -m "$COMMIT_MESSAGE"
+
+  # Pull latest changes from remote before pushing to avoid conflicts.
+  git pull origin main --rebase
+
+  # Push the commit.
+  git push origin main
+
+  echo "✅ Changes pushed to the repository."
+
+  # 6. Send Discord Notification
+  if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+    echo "⚠️ Warning: DISCORD_WEBHOOK_URL is not set. Skipping notification."
+  else
+    echo "📢 Sending Discord notification..."
+    COMMIT_HASH=$(git rev-parse HEAD)
+    COMMIT_URL="https://github.com/$GITHUB_REPOSITORY/commit/$COMMIT_HASH"
+    TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+
+    # Construct a rich embed payload for Discord.
+    JSON_PAYLOAD=$(printf '{
+      "embeds": [{
+        "title": "🚨 New JavaScript Changes Detected!",
+        "color": 16711680,
+        "fields": [
+          {
+            "name": "Target Domain",
+            "value": "%s",
+            "inline": true
+          },
+          {
+            "name": "Commit Link",
+            "value": "[View Commit](%s)",
+            "inline": true
+          }
+        ],
+        "footer": {
+          "text": "Scan completed"
+        },
+        "timestamp": "%s"
+      }]
+    }' "$TARGET_DOMAIN" "$COMMIT_URL" "$TIMESTAMP")
+
+    # Send the notification via curl.
+    curl -H "Content-Type: application/json" -X POST -d "$JSON_PAYLOAD" "$DISCORD_WEBHOOK_URL"
+    echo "✅ Notification sent."
+  fi
+fi
+
+echo "✅ Monitoring script finished successfully."

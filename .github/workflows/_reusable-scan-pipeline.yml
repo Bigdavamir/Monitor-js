@@ -145,46 +145,100 @@ jobs:
           fi
           echo "✅ Consolidation complete."
 
-      - name: Commit Changes and Notify
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+      - name: Detect and Commit Changes
+        id: git_commit
         run: |
-          TARGET_DOMAIN="${{ vars.TARGET_DOMAIN }}"
-          TARGET_DIR="js_files/$TARGET_DOMAIN"
-
+          TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action-bot@github.com"
 
           git add -A "$TARGET_DIR/"
 
           if git diff --staged --quiet; then
-            echo "✅ No changes detected for $TARGET_DOMAIN. All clear!"
+            echo "✅ No changes detected for ${{ vars.TARGET_DOMAIN }}. All clear!"
+            echo "changes_detected=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "🚨 Changes detected! Committing and pushing updates..."
+          git commit -m "[JS Scan] Update files for ${{ vars.TARGET_DOMAIN }}"
+          git pull origin main --rebase
+          git push origin main
+
+          echo "changes_detected=true" >> $GITHUB_OUTPUT
+          # Get the list of changed files from the last commit for this directory
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD -- "$TARGET_DIR/")
+          echo "changed_files<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Analyze Changed Files
+        if: steps.git_commit.outputs.changes_detected == 'true'
+        run: |
+          echo "🐍 Setting up Python and installing analysis tools..."
+          sudo apt-get update && sudo apt-get install -y python3-pip
+          pip install git+https://github.com/m4ll0k/SecretFinder.git
+          pip install git+https://github.com/GerbenJavado/LinkFinder.git
+
+          chmod +x analyze_js.sh
+
+          echo "🔬 Analyzing the following files:"
+          echo "${{ steps.git_commit.outputs.changed_files }}"
+
+          # Pipe the list of changed files to the analysis script
+          echo "${{ steps.git_commit.outputs.changed_files }}" | ./analyze_js.sh
+
+      - name: Upload Analysis Results
+        if: steps.git_commit.outputs.changes_detected == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-results-${{ inputs.environment_name }}-${{ github.run_id }}
+          path: analysis_results/
+
+      - name: Send Enhanced Notification
+        if: steps.git_commit.outputs.changes_detected == 'true'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          TARGET_DOMAIN="${{ vars.TARGET_DOMAIN }}"
+          echo "📢 Preparing and sending enhanced Discord notification..."
+          COMMIT_HASH=$(git rev-parse HEAD)
+          COMMIT_URL="https://github.com/$GITHUB_REPOSITORY/commit/$COMMIT_HASH"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+
+          # Start with a base JSON object for the embed.
+          JSON_PAYLOAD=$(printf '{
+            "embeds": [{
+              "title": "🚨 New JavaScript Changes Detected!",
+              "color": 15158332,
+              "fields": [
+                {"name": "Target", "value": "%s", "inline": true},
+                {"name": "Commit Link", "value": "[View Commit](%s)", "inline": true}
+              ],
+              "footer": {"text": "Analysis powered by SecretFinder & LinkFinder"},
+              "timestamp": "%s"
+            }]
+          }' "$TARGET_DOMAIN" "$COMMIT_URL" "$TIMESTAMP")
+
+          # Conditionally add a field for secrets if the file is not empty.
+          if [ -s analysis_results/secrets.txt ]; then
+            CONTENT=$(head -c 950 analysis_results/secrets.txt)
+            # Use jq to safely add the content as a new field in the 'fields' array.
+            JSON_PAYLOAD=$(echo "$JSON_PAYLOAD" | jq --arg content "$CONTENT" '.embeds[0].fields += [{"name": "🕵️ Secrets Found (Snippet)", "value": ("```\n" + $content + "\n```")}]')
+          fi
+
+          # Conditionally add a field for endpoints if the file is not empty.
+          if [ -s analysis_results/endpoints.txt ]; then
+            CONTENT=$(head -c 950 analysis_results/endpoints.txt)
+            JSON_PAYLOAD=$(echo "$JSON_PAYLOAD" | jq --arg content "$CONTENT" '.embeds[0].fields += [{"name": "🔗 Endpoints Found (Snippet)", "value": ("```\n" + $content + "\n```")}]')
+          fi
+
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "⚠️ DISCORD_WEBHOOK_URL not set. Skipping notification."
+            echo "Payload for debugging:"
+            echo "$JSON_PAYLOAD"
           else
-            echo "🚨 Changes detected for $TARGET_DOMAIN! Committing and pushing updates..."
-            git commit -m "[JS Scan] Update files for $TARGET_DOMAIN"
-            git pull origin main --rebase
-            git push origin main
-
-            if [ -z "$DISCORD_WEBHOOK_URL" ]; then
-              echo "⚠️ DISCORD_WEBHOOK_URL not set. Skipping notification."
-            else
-              echo "📢 Sending Discord notification..."
-              COMMIT_HASH=$(git rev-parse HEAD)
-              COMMIT_URL="https://github.com/$GITHUB_REPOSITORY/commit/$COMMIT_HASH"
-              TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
-
-              JSON_PAYLOAD=$(printf '{
-                "embeds": [{
-                  "title": "🚨 New JavaScript Changes Detected!", "color": 16711680,
-                  "fields": [
-                    {"name": "Target", "value": "%s", "inline": true},
-                    {"name": "Commit Link", "value": "[View Commit](%s)", "inline": true}
-                  ], "footer": {"text": "Scan completed"}, "timestamp": "%s"
-                }]
-              }' "$TARGET_DOMAIN" "$COMMIT_URL" "$TIMESTAMP")
-
-              curl -H "Content-Type: application/json" -X POST -d "$JSON_PAYLOAD" "$DISCORD_WEBHOOK_URL"
-              echo "✅ Notification sent."
-            fi
+            curl -H "Content-Type: application/json" -X POST -d "$JSON_PAYLOAD" "$DISCORD_WEBHOOK_URL"
+            echo "✅ Enhanced notification sent."
           fi

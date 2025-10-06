@@ -2,60 +2,69 @@
 # Exit immediately if a command exits with a non-zero status.
 set -e
 
-# --- Worker Script for Parallel JS Scanning ---
-# This script is designed to be run by a parallel job in the GitHub workflow.
-# It reads a list of subdomains from stdin, scans them, and downloads JS files.
+# --- Worker Script for Parallel JS Downloading & Processing ---
+# This script reads a list of JS URLs from stdin, downloads them,
+# beautifies them, and (in a later step) will attempt to find their source maps.
 
-# 1. Input Validation: Ensure a base target domain is provided for directory structure.
+# 1. Input Validation
 TARGET_DOMAIN="$1"
-if [ -z "$TARGET_DOMAIN" ];
+if [ -z "$TARGET_DOMAIN" ]; then
   echo "Error: Base target domain not provided. This is needed for creating the output directory."
-  echo "Usage: ./monitor.sh <base_target_domain>"
   exit 1
 fi
 
-# 2. Prepare Headers for Scanning Tools (with optional cookie)
+# 2. Prepare Headers for wget
 USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
 WGET_ARGS="--user-agent=$USER_AGENT --quiet --no-check-certificate"
-# Use an array for Katana headers for cleaner handling
-KATANA_HEADER_ARGS=("-H" "User-Agent: $USER_AGENT")
-
 if [ -n "$SESSION_COOKIE" ]; then
-  echo "✅ Session cookie found. Performing authenticated scan."
+  echo "✅ Authenticated download enabled for this worker."
   WGET_ARGS="$WGET_ARGS --header=Cookie:$SESSION_COOKIE"
-  KATANA_HEADER_ARGS+=("-H" "Cookie: $SESSION_COOKIE")
-else
-  echo "ℹ️ No session cookie provided. Performing unauthenticated scan."
 fi
 
-# 3. Create Directory and Temporary File
-# All JS files will be stored under a single directory for the main target.
-# This script instance will place its findings in a directory named with its runner ID.
-# The final job will consolidate these.
+# 3. Create Output Directory
 OUTPUT_DIR="js_files_temp/runner_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${MATRIX_ID:-0}"
 mkdir -p "$OUTPUT_DIR"
-TEMP_JS_URLS=$(mktemp)
 
-# 4. Process Subdomains from Standard Input
-echo "🚀 Starting scan on assigned subdomains..."
-while read -r subdomain; do
-  if [ -z "$subdomain" ]; then continue; fi
-  echo "   - Scanning: https://$subdomain"
-  katana -u "https://$subdomain" -d 5 -c 20 -jc -silent "${KATANA_HEADER_ARGS[@]}" >> "$TEMP_JS_URLS" || echo "⚠️ Katana failed for $subdomain, continuing..."
-done
+echo "🚀 Starting download and processing of assigned JS URLs..."
 
-echo "🔎 Scan complete. Found $(wc -l < "$TEMP_JS_URLS") total JS file URLs (pre-unification)."
+# 4. Process URLs from Standard Input
+while read -r url; do
+  if [ -z "$url" ]; then continue; fi
 
-# 5. Download Unique JavaScript Files
-# Deduplicate URLs before downloading
-sort -u "$TEMP_JS_URLS" | while IFS= read -r url; do
   # Generate a safe, unique filename from the URL
   safe_filename=$(echo "$url" | sed -e 's|https\?://||' -e 's|/|_|g' -e 's|?.*||' -e 's|&.*||' -e 's|=.*||' | tr -c 'a-zA-Z0-9._-' '_')
   if [ -z "$safe_filename" ]; then continue; fi
 
+  JS_FILE_PATH="$OUTPUT_DIR/$safe_filename.js"
+
   # Download the file
-  wget $WGET_ARGS -O "$OUTPUT_DIR/$safe_filename.js" "$url" || echo "⚠️ Could not download: $url"
+  echo "  -> Downloading: $url"
+  if wget $WGET_ARGS -O "$JS_FILE_PATH" "$url"; then
+    # If download is successful and the file is not empty, beautify it.
+    if [ -s "$JS_FILE_PATH" ]; then
+      echo "     - Beautifying: $JS_FILE_PATH"
+      # The -r flag replaces the file in-place.
+      js-beautify -r "$JS_FILE_PATH" || echo "⚠️ js-beautify failed on $JS_FILE_PATH, leaving original."
+    fi
+
+    # --- SOURCE MAP DETECTIVE ---
+    # After successfully processing a .js file, try to find its .map file.
+    MAP_URL="${url}.map"
+    MAP_FILE_PATH="$OUTPUT_DIR/$safe_filename.js.map"
+    echo "     - Searching for source map: $MAP_URL"
+    # The `|| true` prevents the script from exiting on a 404 error.
+    wget $WGET_ARGS -O "$MAP_FILE_PATH" "$MAP_URL" || true
+    # If the map was downloaded and is not empty, we keep it.
+    if [ -s "$MAP_FILE_PATH" ]; then
+        echo "       -> 🎉 Found and downloaded source map!"
+    else
+        # Otherwise, remove the empty file created by wget on failure.
+        rm -f "$MAP_FILE_PATH"
+    fi
+
+  else
+    echo "⚠️ Could not download: $url"
+  fi
 done
 
-rm "$TEMP_JS_URLS"
-echo "✅ Download process complete for this runner. Output at $OUTPUT_DIR"
+echo "✅ Download and beautification complete for this runner."

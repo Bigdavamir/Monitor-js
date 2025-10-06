@@ -1,0 +1,9 @@
+# This file controls the scheduled scans.
+# Add the name of each GitHub Environment you want to be scanned
+# automatically every 12 hours. Each name should be on a new line.
+#
+# Lines starting with # are ignored.
+#
+# Example:
+# target-a-com
+# target-b-org

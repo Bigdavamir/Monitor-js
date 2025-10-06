@@ -1,0 +1,190 @@
+# This is a reusable workflow that contains the core scanning logic.
+# It is called by the main `monitor.yml` controller workflow.
+name: Reusable Scan Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      # The name of the environment to use for this scan run.
+      environment_name:
+        required: true
+        type: string
+    secrets:
+      # We expect a session cookie to be passed down from the calling workflow.
+      # It should be defined in the environment secrets.
+      SESSION_COOKIE:
+        required: false
+      DISCORD_WEBHOOK_URL:
+        required: false
+
+jobs:
+  # Job 1: Discover all subdomains for the target domain
+  discover:
+    runs-on: ubuntu-latest
+    # This associates the job with the specified environment, giving it access
+    # to environment-specific variables (like TARGET_DOMAIN) and secrets.
+    environment: ${{ inputs.environment_name }}
+    outputs:
+      subdomain_count: ${{ steps.split.outputs.count }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Install Discovery Tools
+        run: |
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Discover Subdomains
+        id: discover
+        run: |
+          # The TARGET_DOMAIN is securely retrieved from the environment's variables
+          echo "🔍 Discovering subdomains for ${{ vars.TARGET_DOMAIN }}..."
+          subfinder -d ${{ vars.TARGET_DOMAIN }} -silent -o subdomains.txt
+          echo "✅ Found $(wc -l < subdomains.txt) subdomains."
+
+      - name: Split subdomains for parallel processing
+        id: split
+        run: |
+          mkdir -p subdomain_chunks
+          # Split the subdomains into 20 chunks for the matrix job
+          split -d -n l/20 subdomains.txt subdomain_chunks/chunk_
+          count=$(ls -1q subdomain_chunks/ | wc -l)
+          echo "count=$count" >> $GITHUB_OUTPUT
+          echo "✅ Divided subdomains into $count chunks."
+
+      - name: Upload Subdomain Chunks
+        uses: actions/upload-artifact@v4
+        with:
+          name: subdomain-chunks-${{ inputs.environment_name }}-${{ github.run_id }}
+          path: subdomain_chunks/
+
+  # Job 2: Scan subdomains and download JS files in parallel
+  scan:
+    needs: discover
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        id: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Install Katana
+        run: |
+          go install github.com/projectdiscovery/katana/cmd/katana@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Download Subdomain Chunks Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: subdomain-chunks-${{ inputs.environment_name }}-${{ github.run_id }}
+          path: subdomain_chunks
+
+      - name: Run JS Scan Worker
+        env:
+          # The SESSION_COOKIE is securely passed from the environment's secrets
+          SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
+          MATRIX_ID: ${{ matrix.id }}
+        run: |
+          chmod +x monitor.sh
+          CHUNK_FILE="subdomain_chunks/chunk_$(printf "%02d" ${{ matrix.id }})"
+          if [ -f "$CHUNK_FILE" ]; then
+            # Pass the TARGET_DOMAIN variable from the environment to the script
+            cat "$CHUNK_FILE" | ./monitor.sh "${{ vars.TARGET_DOMAIN }}"
+          else
+            echo "ℹ️ No chunk file for this runner, skipping."
+          fi
+
+      - name: Upload JS Files Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-files-batch-${{ inputs.environment_name }}-${{ matrix.id }}-${{ github.run_id }}
+          path: js_files_temp/
+
+  # Job 3: Consolidate all results, commit changes, and notify
+  consolidate:
+    needs: scan
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment_name }}
+    steps:
+      - name: Checkout Full Git History
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download All JS File Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_js_files/
+          pattern: js-files-batch-${{ inputs.environment_name }}-*-${{ github.run_id }}
+          merge-multiple: true
+
+      - name: Consolidate JS Files
+        run: |
+          TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
+          mkdir -p "$TARGET_DIR"
+          echo "💿 Consolidating all downloaded JS files for ${{ vars.TARGET_DOMAIN }}..."
+          # Check if any files were downloaded before attempting to copy
+          if [ -d "all_js_files" ] && [ "$(ls -A all_js_files)" ]; then
+            find all_js_files -type f -name "*.js" -exec cp -n {} "$TARGET_DIR/" \;
+          else
+            echo "No JS files were downloaded by the scan jobs."
+          fi
+          echo "✅ Consolidation complete."
+
+      - name: Commit Changes and Notify
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          TARGET_DOMAIN="${{ vars.TARGET_DOMAIN }}"
+          TARGET_DIR="js_files/$TARGET_DOMAIN"
+
+          git config --global user.name "GitHub Action Bot"
+          git config --global user.email "action-bot@github.com"
+
+          git add -A "$TARGET_DIR/"
+
+          if git diff --staged --quiet; then
+            echo "✅ No changes detected for $TARGET_DOMAIN. All clear!"
+          else
+            echo "🚨 Changes detected for $TARGET_DOMAIN! Committing and pushing updates..."
+            git commit -m "[JS Scan] Update files for $TARGET_DOMAIN"
+            git pull origin main --rebase
+            git push origin main
+
+            if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+              echo "⚠️ DISCORD_WEBHOOK_URL not set. Skipping notification."
+            else
+              echo "📢 Sending Discord notification..."
+              COMMIT_HASH=$(git rev-parse HEAD)
+              COMMIT_URL="https://github.com/$GITHUB_REPOSITORY/commit/$COMMIT_HASH"
+              TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+
+              JSON_PAYLOAD=$(printf '{
+                "embeds": [{
+                  "title": "🚨 New JavaScript Changes Detected!", "color": 16711680,
+                  "fields": [
+                    {"name": "Target", "value": "%s", "inline": true},
+                    {"name": "Commit Link", "value": "[View Commit](%s)", "inline": true}
+                  ], "footer": {"text": "Scan completed"}, "timestamp": "%s"
+                }]
+              }' "$TARGET_DOMAIN" "$COMMIT_URL" "$TIMESTAMP")
+
+              curl -H "Content-Type: application/json" -X POST -d "$JSON_PAYLOAD" "$DISCORD_WEBHOOK_URL"
+              echo "✅ Notification sent."
+            fi
+          fi

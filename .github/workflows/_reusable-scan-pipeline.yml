@@ -176,7 +176,7 @@ jobs:
         if: steps.git_commit.outputs.changes_detected == 'true'
         run: |
           echo "🐍 Setting up Python and installing analysis tools..."
-          sudo apt-get update && sudo apt-get install -y python3-pip
+          sudo apt-get update && sudo apt-get install -y python3-pip yara
           pip install git+https://github.com/m4ll0k/SecretFinder.git
           pip install git+https://github.com/GerbenJavado/LinkFinder.git
 

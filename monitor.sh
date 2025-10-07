@@ -27,44 +27,50 @@ mkdir -p "$OUTPUT_DIR"
 
 echo "🚀 Starting download and processing of assigned JS URLs..."
 
-# 4. Process URLs from Standard Input
-while read -r url; do
-  if [ -z "$url" ]; then continue; fi
+# 4. Define the URL Processing Function
+# This function handles the download, beautification, and source map search for a single URL.
+process_url() {
+  url="$1"
+  if [ -z "$url" ]; then return; fi
 
   # Generate a safe, unique filename from the URL
   safe_filename=$(echo "$url" | sed -e 's|https\?://||' -e 's|/|_|g' -e 's|?.*||' -e 's|&.*||' -e 's|=.*||' | tr -c 'a-zA-Z0-9._-' '_')
-  if [ -z "$safe_filename" ]; then continue; fi
+  if [ -z "$safe_filename" ]; then return; fi
 
   JS_FILE_PATH="$OUTPUT_DIR/$safe_filename.js"
 
-  # Download the file
+  # Download the file with a 30-second timeout
   echo "  -> Downloading: $url"
-  if wget $WGET_ARGS -O "$JS_FILE_PATH" "$url"; then
+  if wget $WGET_ARGS --timeout=30 -O "$JS_FILE_PATH" "$url"; then
     # If download is successful and the file is not empty, beautify it.
     if [ -s "$JS_FILE_PATH" ]; then
-      echo "     - Beautifying: $JS_FILE_PATH"
       # The -r flag replaces the file in-place.
       js-beautify -r "$JS_FILE_PATH" || echo "⚠️ js-beautify failed on $JS_FILE_PATH, leaving original."
     fi
 
     # --- SOURCE MAP DETECTIVE ---
-    # After successfully processing a .js file, try to find its .map file.
     MAP_URL="${url}.map"
     MAP_FILE_PATH="$OUTPUT_DIR/$safe_filename.js.map"
-    echo "     - Searching for source map: $MAP_URL"
     # The `|| true` prevents the script from exiting on a 404 error.
-    wget $WGET_ARGS -O "$MAP_FILE_PATH" "$MAP_URL" || true
+    wget $WGET_ARGS --timeout=30 -O "$MAP_FILE_PATH" "$MAP_URL" || true
     # If the map was downloaded and is not empty, we keep it.
-    if [ -s "$MAP_FILE_PATH" ]; then
-        echo "       -> 🎉 Found and downloaded source map!"
-    else
-        # Otherwise, remove the empty file created by wget on failure.
+    if [ ! -s "$MAP_FILE_PATH" ]; then
         rm -f "$MAP_FILE_PATH"
     fi
-
   else
     echo "⚠️ Could not download: $url"
   fi
-done
+}
 
-echo "✅ Download and beautification complete for this runner."
+# Export the function and variables so they can be used by xargs
+export -f process_url
+export WGET_ARGS
+export OUTPUT_DIR
+
+# 5. Process URLs in Parallel
+# Use xargs to run up to 10 parallel jobs of the process_url function.
+# The --no-run-if-empty flag prevents an error if stdin is empty.
+# The -I {} syntax is used to properly handle URLs with special characters.
+cat | xargs -P 10 --no-run-if-empty -I {} bash -c 'process_url "$@"' _ {}
+
+echo "✅ All parallel downloads and processing complete for this runner."

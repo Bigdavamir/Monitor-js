@@ -79,6 +79,10 @@ jobs:
           mkdir -p url_chunks
           # Split the file into chunks of 10000 lines each. This is more scalable than a fixed number of chunks.
           split -d -l 10000 all_js_urls.txt url_chunks/chunk_
+
+          # Split the file into chunks of 2000 lines each. This is more scalable than a fixed number of chunks.
+          split -d -l 8000 all_js_urls.txt url_chunks/chunk_
+
           count=$(ls -1q url_chunks/ | wc -l)
           # If no files were created (because input was empty), count will be 0.
           if [ "$count" -eq 0 ]; then

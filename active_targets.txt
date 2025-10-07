@@ -7,3 +7,4 @@
 # Example:
 # target-a-com
 # target-b-org
+ atlassian-com

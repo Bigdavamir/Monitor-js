@@ -1,0 +1,279 @@
+# This is a reusable workflow that contains the core scanning logic.
+# It is called by the main `monitor.yml` controller workflow.
+name: Reusable Scan Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      # The name of the environment to use for this scan run.
+      environment_name:
+        required: true
+        type: string
+    secrets:
+      # We expect a session cookie to be passed down from the calling workflow.
+      # It should be defined in the environment secrets.
+      SESSION_COOKIE:
+        required: false
+      DISCORD_WEBHOOK_URL:
+        required: false
+
+jobs:
+  # Job 1: Discover all JS URLs from live and historical sources
+  discover_urls:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment_name }}
+    outputs:
+      # The number of chunks created, for conditional execution of the next job.
+      count: ${{ steps.split.outputs.count }}
+      # The JSON array representing the matrix for the next job, e.g., "[0,1,2]"
+      matrix: ${{ steps.split.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Install Discovery Tools
+        run: |
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install -v github.com/projectdiscovery/katana/cmd/katana@latest
+          go install -v github.com/lc/gau/v2/cmd/gau@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run Comprehensive Discovery
+        id: discover
+        env:
+          SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
+        run: |
+          TARGET_DOMAIN="${{ vars.TARGET_DOMAIN }}"
+          echo "🔍 Discovering assets for $TARGET_DOMAIN..."
+
+          # Prepare Katana headers. User-Agent is generic, cookie is optional.
+          KATANA_HEADER_ARGS=("-H" "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36")
+          if [ -n "$SESSION_COOKIE" ]; then
+            KATANA_HEADER_ARGS+=("-H" "Cookie: $SESSION_COOKIE")
+          fi
+
+          # Step 1: Find live subdomains
+          subfinder -d $TARGET_DOMAIN -silent -o subdomains.txt
+          echo "Found $(wc -l < subdomains.txt) live subdomains."
+
+          # Step 2: Actively crawl live subdomains for JS files
+          katana -list subdomains.txt -jc -silent -d 5 -c 20 "${KATANA_HEADER_ARGS[@]}" -o katana-js.txt || echo "Katana finished with some errors, continuing..."
+          echo "Found $(wc -l < katana-js.txt) JS files from active crawling."
+
+          # Step 3: Find historical JS files from wayback machines
+          gau --threads 5 --subs $TARGET_DOMAIN | grep -iE '\.js$' | sort -u > gau-js.txt
+          echo "Found $(wc -l < gau-js.txt) JS files from historical archives."
+
+          # Step 4: Combine, unify, and filter results
+          cat katana-js.txt gau-js.txt | sort -u > all_js_urls.txt
+          echo "✅ Total unique JS URLs found: $(wc -l < all_js_urls.txt)"
+
+      - name: Split JS URLs for dynamic parallel processing
+        id: split
+        run: |
+          mkdir -p url_chunks
+          # Split the file into chunks of 2000 lines each. This is more scalable than a fixed number of chunks.
+          split -d -l 2000 all_js_urls.txt url_chunks/chunk_
+          count=$(ls -1q url_chunks/ | wc -l)
+          # If no files were created (because input was empty), count will be 0.
+          if [ "$count" -eq 0 ]; then
+            echo "No URLs found to process. Setting count to 0."
+            echo "count=0" >> $GITHUB_OUTPUT
+            echo "matrix=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # Generate a JSON array of numbers from 0 to count-1, e.g., [0,1,2] for a count of 3.
+          # This will be used to create the dynamic matrix for the next job.
+          matrix_json=$(seq 0 $(($count - 1)) | jq -R . | jq -s -c .)
+          echo "count=$count" >> $GITHUB_OUTPUT
+          echo "matrix=${matrix_json}" >> $GITHUB_OUTPUT
+          echo "✅ Divided JS URLs into $count chunks for dynamic parallel download."
+
+      - name: Upload URL Chunks
+        uses: actions/upload-artifact@v4
+        with:
+          name: url-chunks-${{ inputs.environment_name }}-${{ github.run_id }}
+          path: url_chunks/
+
+  # Job 2: Download, beautify, and process JS files in parallel
+  download_and_process:
+    needs: discover_urls
+    # Only run this job if the previous job actually found URLs and created chunks.
+    if: needs.discover_urls.outputs.count > 0
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment_name }}
+    strategy:
+      fail-fast: false
+      # The matrix is now dynamically generated based on the number of URL chunks.
+      matrix:
+        id: ${{ fromJson(needs.discover_urls.outputs.matrix) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js for JS Beautifier
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install JS Beautifier
+        run: npm install -g js-beautify
+
+      - name: Download URL Chunks Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: url-chunks-${{ inputs.environment_name }}-${{ github.run_id }}
+          path: url_chunks
+
+      - name: Run JS Download & Process Worker
+        env:
+          SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
+          MATRIX_ID: ${{ matrix.id }}
+        run: |
+          chmod +x monitor.sh
+          CHUNK_FILE="url_chunks/chunk_$(printf "%02d" ${{ matrix.id }})"
+          if [ -f "$CHUNK_FILE" ]; then
+            cat "$CHUNK_FILE" | ./monitor.sh "${{ vars.TARGET_DOMAIN }}"
+          else
+            echo "ℹ️ No URL chunk file for this runner, skipping."
+          fi
+
+      - name: Upload JS Files Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-files-batch-${{ inputs.environment_name }}-${{ matrix.id }}-${{ github.run_id }}
+          path: js_files_temp/
+
+  # Job 3: Consolidate all results, commit changes, and notify
+  consolidate:
+    needs: download_and_process
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment_name }}
+    steps:
+      - name: Checkout Full Git History
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download All JS File Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_js_files/
+          pattern: js-files-batch-${{ inputs.environment_name }}-*-${{ github.run_id }}
+          merge-multiple: true
+
+      - name: Consolidate JS Files
+        run: |
+          TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
+          mkdir -p "$TARGET_DIR"
+          echo "💿 Consolidating all downloaded JS files for ${{ vars.TARGET_DOMAIN }}..."
+          # Check if any files were downloaded before attempting to copy
+          if [ -d "all_js_files" ] && [ "$(ls -A all_js_files)" ]; then
+            find all_js_files -type f -name "*.js" -exec cp -n {} "$TARGET_DIR/" \;
+          else
+            echo "No JS files were downloaded by the scan jobs."
+          fi
+          echo "✅ Consolidation complete."
+
+      - name: Detect and Commit Changes
+        id: git_commit
+        run: |
+          TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
+          git config --global user.name "GitHub Action Bot"
+          git config --global user.email "action-bot@github.com"
+
+          git add -A "$TARGET_DIR/"
+
+          if git diff --staged --quiet; then
+            echo "✅ No changes detected for ${{ vars.TARGET_DOMAIN }}. All clear!"
+            echo "changes_detected=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "🚨 Changes detected! Committing and pushing updates..."
+          git commit -m "[JS Scan] Update files for ${{ vars.TARGET_DOMAIN }}"
+          git pull origin main --rebase
+          git push origin main
+
+          echo "changes_detected=true" >> $GITHUB_OUTPUT
+          # Get the list of changed files from the last commit for this directory
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD -- "$TARGET_DIR/")
+          echo "changed_files<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Analyze Changed Files
+        if: steps.git_commit.outputs.changes_detected == 'true'
+        run: |
+          echo "🐍 Setting up Python and installing analysis tools..."
+          sudo apt-get update && sudo apt-get install -y python3-pip yara
+          pip install git+https://github.com/m4ll0k/SecretFinder.git
+          pip install git+https://github.com/GerbenJavado/LinkFinder.git
+
+          chmod +x analyze_js.sh
+
+          echo "🔬 Analyzing the following files:"
+          echo "${{ steps.git_commit.outputs.changed_files }}"
+
+          # Pipe the list of changed files to the analysis script
+          echo "${{ steps.git_commit.outputs.changed_files }}" | ./analyze_js.sh
+
+      - name: Upload Analysis Results
+        if: steps.git_commit.outputs.changes_detected == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-results-${{ inputs.environment_name }}-${{ github.run_id }}
+          path: analysis_results/
+
+      - name: Send Enhanced Notification
+        if: steps.git_commit.outputs.changes_detected == 'true'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          TARGET_DOMAIN="${{ vars.TARGET_DOMAIN }}"
+          echo "📢 Preparing and sending enhanced Discord notification..."
+          COMMIT_HASH=$(git rev-parse HEAD)
+          COMMIT_URL="https://github.com/$GITHUB_REPOSITORY/commit/$COMMIT_HASH"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+
+          # Start with a base JSON object for the embed.
+          JSON_PAYLOAD=$(printf '{
+            "embeds": [{
+              "title": "🚨 New JavaScript Changes Detected!",
+              "color": 15158332,
+              "fields": [
+                {"name": "Target", "value": "%s", "inline": true},
+                {"name": "Commit Link", "value": "[View Commit](%s)", "inline": true}
+              ],
+              "footer": {"text": "Analysis powered by SecretFinder & LinkFinder"},
+              "timestamp": "%s"
+            }]
+          }' "$TARGET_DOMAIN" "$COMMIT_URL" "$TIMESTAMP")
+
+          # Conditionally add a field for secrets if the file is not empty.
+          if [ -s analysis_results/secrets.txt ]; then
+            CONTENT=$(head -c 950 analysis_results/secrets.txt)
+            # Use jq to safely add the content as a new field in the 'fields' array.
+            JSON_PAYLOAD=$(echo "$JSON_PAYLOAD" | jq --arg content "$CONTENT" '.embeds[0].fields += [{"name": "🕵️ Secrets Found (Snippet)", "value": ("```\n" + $content + "\n```")}]')
+          fi
+
+          # Conditionally add a field for endpoints if the file is not empty.
+          if [ -s analysis_results/endpoints.txt ]; then
+            CONTENT=$(head -c 950 analysis_results/endpoints.txt)
+            JSON_PAYLOAD=$(echo "$JSON_PAYLOAD" | jq --arg content "$CONTENT" '.embeds[0].fields += [{"name": "🔗 Endpoints Found (Snippet)", "value": ("```\n" + $content + "\n```")}]')
+          fi
+
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "⚠️ DISCORD_WEBHOOK_URL not set. Skipping notification."
+            echo "Payload for debugging:"
+            echo "$JSON_PAYLOAD"
+          else
+            curl -H "Content-Type: application/json" -X POST -d "$JSON_PAYLOAD" "$DISCORD_WEBHOOK_URL"
+            echo "✅ Enhanced notification sent."
+          fi

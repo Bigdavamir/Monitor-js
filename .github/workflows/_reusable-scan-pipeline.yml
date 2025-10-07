@@ -23,7 +23,10 @@ jobs:
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment_name }}
     outputs:
-      url_chunks_count: ${{ steps.split.outputs.count }}
+      # The number of chunks created, for conditional execution of the next job.
+      count: ${{ steps.split.outputs.count }}
+      # The JSON array representing the matrix for the next job, e.g., "[0,1,2]"
+      matrix: ${{ steps.split.outputs.matrix }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -70,15 +73,26 @@ jobs:
           cat katana-js.txt gau-js.txt | sort -u > all_js_urls.txt
           echo "✅ Total unique JS URLs found: $(wc -l < all_js_urls.txt)"
 
-      - name: Split JS URLs for parallel processing
+      - name: Split JS URLs for dynamic parallel processing
         id: split
         run: |
           mkdir -p url_chunks
-          # Split the JS URLs into 20 chunks for the matrix job
-          split -d -n l/20 all_js_urls.txt url_chunks/chunk_
+          # Split the file into chunks of 500 lines each. This is more scalable than a fixed number of chunks.
+          split -d -l 500 all_js_urls.txt url_chunks/chunk_
           count=$(ls -1q url_chunks/ | wc -l)
+          # If no files were created (because input was empty), count will be 0.
+          if [ "$count" -eq 0 ]; then
+            echo "No URLs found to process. Setting count to 0."
+            echo "count=0" >> $GITHUB_OUTPUT
+            echo "matrix=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # Generate a JSON array of numbers from 0 to count-1, e.g., [0,1,2] for a count of 3.
+          # This will be used to create the dynamic matrix for the next job.
+          matrix_json=$(seq 0 $(($count - 1)) | jq -R . | jq -s -c .)
           echo "count=$count" >> $GITHUB_OUTPUT
-          echo "✅ Divided JS URLs into $count chunks for parallel download."
+          echo "matrix=${matrix_json}" >> $GITHUB_OUTPUT
+          echo "✅ Divided JS URLs into $count chunks for dynamic parallel download."
 
       - name: Upload URL Chunks
         uses: actions/upload-artifact@v4
@@ -89,12 +103,15 @@ jobs:
   # Job 2: Download, beautify, and process JS files in parallel
   download_and_process:
     needs: discover_urls
+    # Only run this job if the previous job actually found URLs and created chunks.
+    if: needs.discover_urls.outputs.count > 0
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment_name }}
     strategy:
       fail-fast: false
+      # The matrix is now dynamically generated based on the number of URL chunks.
       matrix:
-        id: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        id: ${{ fromJson(needs.discover_urls.outputs.matrix) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

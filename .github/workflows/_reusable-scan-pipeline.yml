@@ -150,6 +150,7 @@ jobs:
   # Job 3: Consolidate all results, commit changes, and notify
   consolidate:
     needs: download_and_process
+    if: always()
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment_name }}
     steps:
@@ -163,7 +164,6 @@ jobs:
         with:
           path: all_js_files/
           pattern: js-files-batch-${{ inputs.environment_name }}-*-${{ github.run_id }}
-          merge-multiple: true
           # Don't fail the workflow if no files were downloaded.
           if-no-files-found: warn
 

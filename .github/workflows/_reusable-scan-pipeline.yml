@@ -259,18 +259,17 @@ jobs:
           # Conditionally add a field for secrets if the file is not empty.
           if [ -s analysis_results/secrets.txt ]; then
             CONTENT=$(head -c 950 analysis_results/secrets.txt)
-            # Use jq to safely add the content as a new field in the 'fields' array.
-            JSON_PAYLOAD=$(echo "$JSON_PAYLOAD" | jq --arg content "$CONTENT" '.embeds[0].fields += [{"name": "🕵️ Secrets Found (Snippet)", "value": ("```
-" + $content + "
-```")}]')
+            # Format the content safely for JSON, then pass to jq
+            FORMATTED_CONTENT=$(printf '```\n%s\n```' "$CONTENT")
+            JSON_PAYLOAD=$(echo "$JSON_PAYLOAD" | jq --arg content "$FORMATTED_CONTENT" '.embeds[0].fields += [{"name": "🕵️ Secrets Found (Snippet)", "value": $content}]')
           fi
 
           # Conditionally add a field for endpoints if the file is not empty.
           if [ -s analysis_results/endpoints.txt ]; then
             CONTENT=$(head -c 950 analysis_results/endpoints.txt)
-            JSON_PAYLOAD=$(echo "$JSON_PAYLOAD" | jq --arg content "$CONTENT" '.embeds[0].fields += [{"name": "🔗 Endpoints Found (Snippet)", "value": ("```
-" + $content + "
-```")}]')
+            # Format the content safely for JSON, then pass to jq
+            FORMATTED_CONTENT=$(printf '```\n%s\n```' "$CONTENT")
+            JSON_PAYLOAD=$(echo "$JSON_PAYLOAD" | jq --arg content "$FORMATTED_CONTENT" '.embeds[0].fields += [{"name": "🔗 Endpoints Found (Snippet)", "value": $content}]')
           fi
 
           if [ -z "$DISCORD_WEBHOOK_URL" ]; then

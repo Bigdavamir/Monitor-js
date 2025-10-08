@@ -1,5 +1,3 @@
-# This is a reusable workflow that contains the core scanning logic.
-# It is called by the main `monitor.yml` controller workflow.
 name: Reusable Scan Pipeline
 
 on:
@@ -79,10 +77,6 @@ jobs:
           mkdir -p url_chunks
           # Split the file into chunks of 10000 lines each. This is more scalable than a fixed number of chunks.
           split -d -l 10000 all_js_urls.txt url_chunks/chunk_
-
-          # Split the file into chunks of 2000 lines each. This is more scalable than a fixed number of chunks.
-          split -d -l 8000 all_js_urls.txt url_chunks/chunk_
-
           count=$(ls -1q url_chunks/ | wc -l)
           # If no files were created (because input was empty), count will be 0.
           if [ "$count" -eq 0 ]; then
@@ -170,6 +164,8 @@ jobs:
           path: all_js_files/
           pattern: js-files-batch-${{ inputs.environment_name }}-*-${{ github.run_id }}
           merge-multiple: true
+          # Don't fail the workflow if no files were downloaded.
+          if-no-files-found: warn
 
       - name: Consolidate JS Files
         run: |
@@ -264,13 +260,17 @@ jobs:
           if [ -s analysis_results/secrets.txt ]; then
             CONTENT=$(head -c 950 analysis_results/secrets.txt)
             # Use jq to safely add the content as a new field in the 'fields' array.
-            JSON_PAYLOAD=$(echo "$JSON_PAYLOAD" | jq --arg content "$CONTENT" '.embeds[0].fields += [{"name": "🕵️ Secrets Found (Snippet)", "value": ("```\n" + $content + "\n```")}]')
+            JSON_PAYLOAD=$(echo "$JSON_PAYLOAD" | jq --arg content "$CONTENT" '.embeds[0].fields += [{"name": "🕵️ Secrets Found (Snippet)", "value": ("```
+" + $content + "
+```")}]')
           fi
 
           # Conditionally add a field for endpoints if the file is not empty.
           if [ -s analysis_results/endpoints.txt ]; then
             CONTENT=$(head -c 950 analysis_results/endpoints.txt)
-            JSON_PAYLOAD=$(echo "$JSON_PAYLOAD" | jq --arg content "$CONTENT" '.embeds[0].fields += [{"name": "🔗 Endpoints Found (Snippet)", "value": ("```\n" + $content + "\n```")}]')
+            JSON_PAYLOAD=$(echo "$JSON_PAYLOAD" | jq --arg content "$CONTENT" '.embeds[0].fields += [{"name": "🔗 Endpoints Found (Snippet)", "value": ("```
+" + $content + "
+```")}]')
           fi
 
           if [ -z "$DISCORD_WEBHOOK_URL" ]; then

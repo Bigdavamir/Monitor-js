@@ -166,7 +166,6 @@ jobs:
           path: all_js_files/
           pattern: js-files-batch-${{ inputs.environment_name }}-*-${{ github.run_id }}
           merge-multiple: true
-          # Don't fail the workflow if no files were downloaded.
           if-no-files-found: warn
 
       - name: Consolidate JS Files

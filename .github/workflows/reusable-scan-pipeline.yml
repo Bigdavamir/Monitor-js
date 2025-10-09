@@ -29,6 +29,8 @@ jobs:
         uses: actions/setup-go@v4
         with:
           go-version: '1.21'
+          cache: false
+          cache: false
       - name: Install Discovery Tools
         run: |
           go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
@@ -128,7 +130,7 @@ jobs:
           cat katana-js.txt gau-js.txt | sort -u > all_js_urls.txt
           OUTPUT_DIR="js_files_temp/runner_${{ matrix.chunk_file }}"
           mkdir -p "$OUTPUT_DIR"
-          WGET_ARGS="--user-agent=Mozilla/5.0 --quiet --no-check-certificate"
+          WGET_ARGS="--user-agent=Mozilla/5.0 --quiet --no-check-certificate --tries=3"
           if [ -n "$SESSION_COOKIE" ]; then WGET_ARGS="$WGET_ARGS --header=Cookie:$SESSION_COOKIE"; fi
 
           # This function processes a single URL. It downloads the JS file using a
@@ -184,7 +186,6 @@ jobs:
         with:
           path: all_js_files/
           pattern: js-files-batch-${{ inputs.environment_name }}-*-${{ github.run_id }}
-          if-no-files-found: warn
       - name: Consolidate JS Files and Index
         run: |
           TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"

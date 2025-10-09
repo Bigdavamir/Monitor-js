@@ -13,7 +13,8 @@ on:
 
   schedule:
     - cron: '0 */12 * * *'
-
+permissions:
+    contents: write
 jobs:
   # This job handles a single scan, triggered manually from the UI.
   manual_scan:

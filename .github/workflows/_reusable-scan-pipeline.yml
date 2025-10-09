@@ -67,12 +67,33 @@ jobs:
           KATANA_HEADER_ARGS=("-H" "User-Agent: Mozilla/5.0")
           if [ -n "$SESSION_COOKIE" ]; then KATANA_HEADER_ARGS+=("-H" "Cookie: $SESSION_COOKIE"); fi
           
-          # Run discovery tools on the single domain
+          # Run Katana on the single domain
           katana -list target.txt -jc -silent -d 5 -c 25 "${KATANA_HEADER_ARGS[@]}" -o katana-js.txt || true
-          cat target.txt | gau --threads 5 > gau-js.txt
           
+          # --- GAU FIX ---
+          # Run gau and IMMEDIATELY filter its output to keep only the exact target domain.
+          # This prevents subdomain URLs from polluting the results.
+          echo "Running gau and filtering for exact domain: ${{ vars.TARGET_DOMAIN }}"
+          cat target.txt | gau --threads 5 | grep -iE "^https?://(www\.)?${{ vars.TARGET_DOMAIN }}/" > gau-js.txt
+          # --- END OF FIX ---
+
           # Combine, sort, and strictly filter for .js files
-          cat katana-js.txt gau-js.txt | sort -u | grep -iE '\.js$' > all_js_urls.txt
+          echo "Combining and filtering results for JS files..."
+          cat katana-js.txt gau-js.txt | sort -u > all_urls.txt
+          
+          # Improved JS file filtering
+          # Method 1: Get URLs ending in .js (with optional query parameters)
+          grep -iE '\.js($|\?)' all_urls.txt > all_js_urls.txt
+
+          # Method 2: Probe remaining URLs to find JS files by Content-Type
+          # We need jq for this, so ensure it's installed in the previous step.
+          grep -ivE '\.js($|\?)' all_urls.txt | httpx -silent -threads 25 -json -o probed.json || true
+          if [ -s probed.json ]; then
+            jq -r 'select(.content_type != null and (.content_type | test("javascript|x-javascript|text/javascript|application/ecmascript"))) .url' probed.json >> all_js_urls.txt
+          fi
+
+          # Final deduplication
+          sort -u -o all_js_urls.txt all_js_urls.txt
 
           echo "Found $(wc -l < all_js_urls.txt) unique JS URLs to process."
           OUTPUT_DIR="js_files_temp"
@@ -98,6 +119,7 @@ jobs:
           }
           export -f process_url; export WGET_ARGS; export OUTPUT_DIR
           cat all_js_urls.txt | xargs -P 25 --no-run-if-empty -I {} bash -c 'process_url "$@"' _ {}
+
 
       - name: Consolidate and Commit Changes
         id: git_commit

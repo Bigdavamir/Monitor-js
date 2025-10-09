@@ -121,36 +121,53 @@ jobs:
           cat all_js_urls.txt | xargs -P 25 --no-run-if-empty -I {} bash -c 'process_url "$@"' _ {}
 
 
+      # In .github/workflows/_reusable-scan-pipeline.yml
+# Inside the job: 'consolidate-and-commit'
+
       - name: Consolidate and Commit Changes
-        id: git_commit
+        id: commit
         run: |
-          TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
-          mkdir -p "$TARGET_DIR"
+          echo "Consolidating JS files from all runners..."
+          # Move all downloaded files and their index files to the final destination
+          find js_files_temp -name "*.js" -exec mv {} js_files/${{ vars.TARGET_DOMAIN }}/ \;
+          find js_files_temp -name "index.txt" -exec cat {} + >> js_files/${{ vars.TARGET_DOMAIN }}/index.txt \;
+          
+          # Clean up the temp directory
+          rm -rf js_files_temp
 
-          # Use rsync to move new files and create the index
-          rsync -av js_files_temp/ "$TARGET_DIR/"
-
-          if [ -f "$TARGET_DIR/index.txt" ]; then
-             sort -u -o "$TARGET_DIR/index.txt" "$TARGET_DIR/index.txt"
-          fi
-
+          # Configure Git user
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action-bot@github.com"
-          git add -A "$TARGET_DIR/"
 
+          # Check for changes
+          if [[ -z $(git status --porcelain) ]]; then
+            echo "No changes detected. Nothing to commit."
+            echo "changes_detected=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Changes detected. Preparing to commit."
+          echo "changes_detected=true" >> $GITHUB_OUTPUT
+
+          git add js_files/${{ vars.TARGET_DOMAIN }}
+
+          # Check again if add resulted in staged changes
           if git diff --staged --quiet; then
-            echo "No new JS files found for ${{ vars.TARGET_DOMAIN }}."
+            echo "No effective changes to commit after adding files."
             echo "changes_detected=false" >> $GITHUB_OUTPUT
             exit 0
           fi
           
-          git commit -m "[JS Scan] Update files for ${{ vars.TARGET_DOMAIN }}"
+          git commit -m "[JS Scan] Update files for ${{ vars.TARGET_DOMAIN }}" -m "Scan triggered by ${{ github.event_name }} for ${{ vars.TARGET_DOMAIN }}."
+
+          # --- KEY FIX: Pull latest changes with rebase before pushing ---
+          # This syncs the local repo with the remote, avoiding the rejection error.
+          echo "Pulling latest changes from remote..."
+          git pull --rebase
+
+          echo "Pushing changes to remote..."
           git push
-          echo "changes_detected=true" >> $GITHUB_OUTPUT
-          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD -- "$TARGET_DIR/")
-          echo "changed_files<<EOF" >> $GITHUB_OUTPUT
-          echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+
 
       - name: Analyze Changed Files & Notify
         if: steps.git_commit.outputs.changes_detected == 'true'

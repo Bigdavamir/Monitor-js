@@ -114,58 +114,56 @@ jobs:
         with:
           name: subdomain-chunks-${{ inputs.environment_name }}-${{ github.run_id }}
           path: chunks/
-      - name: Discover and Process JS files
+      - name: Discover and Process JS files (Debug Mode)
         env:
           SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
         run: |
           CHUNK_FILE="chunks/${{ matrix.chunk_file }}"
+          
+          # DEBUG: Print the contents of the input file to ensure it's not empty.
+          echo "--- DEBUG: Reading subdomains from ${CHUNK_FILE} ---"
+          cat $CHUNK_FILE
+          echo "----------------------------------------------------"
+
           KATANA_HEADER_ARGS=("-H" "User-Agent: Mozilla/5.0")
           if [ -n "$SESSION_COOKIE" ]; then KATANA_HEADER_ARGS+=("-H" "Cookie: $SESSION_COOKIE"); fi
-          # Actively crawl the subdomains in this chunk for JS files.
-          katana -list $CHUNK_FILE -jc -silent -d 5 -c 20 "${KATANA_HEADER_ARGS[@]}" -o katana-js.txt || true
-          # Find historical JS files for the subdomains in this chunk by piping them to gau.
-          cat $CHUNK_FILE | gau --threads 5 | grep -iE '\.js$' | sort -u > gau-js.txt
-          cat katana-js.txt gau-js.txt | sort -u > all_js_urls.txt
-          OUTPUT_DIR="js_files_temp/runner_${{ matrix.chunk_file }}"
-          mkdir -p "$OUTPUT_DIR"
-          WGET_ARGS="--user-agent=Mozilla/5.0 --quiet --no-check-certificate"
-          if [ -n "$SESSION_COOKIE" ]; then WGET_ARGS="$WGET_ARGS --header=Cookie:$SESSION_COOKIE"; fi
-          
-          # This function processes a single URL. It downloads the JS file using a
-          # hash-based filename to avoid "filename too long" errors and creates
-          # an index file to map hashes back to their original URLs.
-          process_url() {
-            url="$1"
-            if [ -z "$url" ]; then return; fi
-            
-            # Generate a fixed-length filename using the MD5 hash of the URL.
-            hashed_filename=$(echo -n "$url" | md5sum | awk '{print $1}').js
-            JS_FILE_PATH="$OUTPUT_DIR/$hashed_filename"
-            
-            # Download the file, saving it to the hashed filename.
-            if wget $WGET_ARGS --timeout=30 -O "$JS_FILE_PATH" "$url"; then
-              # If download is successful and the file is not empty, beautify it.
-              if [ -s "$JS_FILE_PATH" ]; then
-                js-beautify -r "$JS_FILE_PATH" || echo "⚠️ js-beautify failed on $JS_FILE_PATH"
-                # Record the mapping of the hash to the original URL in an index file.
-                echo "$hashed_filename,$url" >> "$OUTPUT_DIR/index.txt"
-              else
-                # If the downloaded file is empty, remove it to save space.
-                rm -f "$JS_FILE_PATH"
-              fi
-            else
-              echo "⚠️ Could not download: $url"
-            fi
-          }
 
-          export -f process_url; export WGET_ARGS; export OUTPUT_DIR
-          # Process all found URLs in parallel.
-          cat all_js_urls.txt | xargs -P 10 --no-run-if-empty -I {} bash -c 'process_url "$@"' _ {}
+          # Actively crawl the subdomains in this chunk for JS files.
+          # NOTE: Removed '|| true' to ensure the step fails if Katana has an error.
+          katana -list $CHUNK_FILE -jc -silent -d 5 -c 20 "${KATANA_HEADER_ARGS[@]}" -o katana-js.txt
+
+          # Find historical JS files for the subdomains in this chunk.
+          cat $CHUNK_FILE | gau --threads 5 | grep -iE '\.js$' | sort -u > gau-js.txt
+          
+          # DEBUG: Print the output of each tool.
+          echo "--- DEBUG: Katana found $(wc -l < katana-js.txt) URLs ---"
+          cat katana-js.txt
+          echo "---------------------------------------------------------"
+          
+          echo "--- DEBUG: Gau found $(wc -l < gau-js.txt) URLs ---"
+          cat gau-js.txt
+          echo "---------------------------------------------------"
+          
+          # Combine results
+          cat katana-js.txt gau-js.txt | sort -u > all_js_urls.txt
+
+          # DEBUG: Print the final combined list and its size.
+          echo "--- DEBUG: Total unique JS URLs found: $(wc -l < all_js_urls.txt) ---"
+          cat all_js_urls.txt
+          echo "------------------------------------------------------------------"
+
+          # Now, call the original download script with the final list.
+          # If 'all_js_urls.txt' is empty, the script will do nothing, which is expected.
+          cat all_js_urls.txt | ./monitor.sh "${{ vars.TARGET_DOMAIN }}"
+
       - name: Upload Processed JS files
+        if: success() # Only upload if the previous step succeeded.
         uses: actions/upload-artifact@v4
         with:
           name: js-files-batch-${{ inputs.environment_name }}-${{ matrix.chunk_file }}-${{ github.run_id }}
-          path: js_files_temp/** # <--- THIS IS THE ONLY CHANGE NEEDED
+          path: js_files_temp/
+          if-no-files-found: warn # Keep this to avoid errors if no files were downloaded
+
 
   # Job 4: Consolidate all results, commit changes, and notify.
   consolidate:

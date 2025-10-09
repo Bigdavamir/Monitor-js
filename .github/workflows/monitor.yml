@@ -18,7 +18,7 @@ jobs:
   # This job handles a single scan, triggered manually from the UI.
   manual_scan:
     if: github.event_name == 'workflow_dispatch'
-    uses: ./.github/workflows/reusable-scan-pipeline.yml # <--- CORRECTED PATH
+    uses: .github/workflows/reusable-scan-pipeline.yml # <--- THIS IS NOW CORRECT
     with:
       environment_name: ${{ github.event.inputs.target_environment }}
     secrets: inherit
@@ -52,7 +52,7 @@ jobs:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.read_scheduled_targets.outputs.matrix) }}
-    uses: ./.github/workflows/reusable-scan-pipeline.yml # <--- CORRECTED PATH
+    uses: .github/workflows/reusable-scan-pipeline.yml # <--- THIS IS NOW CORRECT
     with:
       environment_name: ${{ matrix.target }}
     secrets: inherit

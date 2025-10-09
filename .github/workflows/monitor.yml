@@ -1,15 +1,8 @@
-# This single file contains a complete, refactored monitoring system.
-# It uses a reusable workflow pattern: controller jobs at the top call the main scan logic within the same file.
-name: Refactored JS Monitor
+# This workflow acts as the main controller for the JS monitoring system.
+# It handles triggers (manual and scheduled) and calls the reusable scan pipeline
+# for the appropriate target environments.
+name: JS Monitor Controller
 
-# -----------------------------------------------------------------------------
-# TRIGGERS
-# -----------------------------------------------------------------------------
-# This workflow can be triggered in three ways:
-# 1. Manual Dispatch: For running a scan on a single, user-selected target.
-# 2. Scheduled: For automatically running scans on all targets listed in active_targets.txt.
-# 3. Reusable Call: The main scan logic is defined as a reusable workflow, called by the controller jobs below.
-# -----------------------------------------------------------------------------
 on:
   workflow_dispatch:
     inputs:
@@ -21,34 +14,17 @@ on:
   schedule:
     - cron: '0 */12 * * *'
 
-  workflow_call:
-    inputs:
-      environment_name:
-        required: true
-        type: string
-    secrets:
-      SESSION_COOKIE:
-        required: false
-      DISCORD_WEBHOOK_URL:
-        required: false
-
-# -----------------------------------------------------------------------------
-# CONTROLLER JOBS
-# -----------------------------------------------------------------------------
-# These jobs determine which target(s) to scan and then trigger the reusable
-# scan workflow for each one.
-# -----------------------------------------------------------------------------
 jobs:
-  # This controller job handles a single scan, triggered manually from the UI.
-  manual_scan_controller:
+  # This job handles a single scan, triggered manually from the UI.
+  manual_scan:
     if: github.event_name == 'workflow_dispatch'
-    uses: ./.github/workflows/monitor.yml # Calls this same workflow file
+    uses: ./.github/workflows/reusable-scan-pipeline.yml
     with:
       environment_name: ${{ github.event.inputs.target_environment }}
     secrets: inherit
 
   # For scheduled runs, this job reads active_targets.txt to get the list of targets.
-  read_scheduled_targets_controller:
+  read_scheduled_targets:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     outputs:
@@ -68,230 +44,15 @@ jobs:
           echo "json=${JSON_ARRAY}" >> $GITHUB_OUTPUT
           echo "Scheduled targets found: ${JSON_ARRAY}"
 
-  # This controller job runs the scan pipeline in parallel for each scheduled target.
-  scheduled_scan_controller:
-    needs: read_scheduled_targets_controller
-    if: github.event_name == 'schedule' && needs.read_scheduled_targets_controller.outputs.matrix != '[]'
+  # This job runs the scan pipeline in parallel for each scheduled target.
+  scheduled_scan_matrix:
+    needs: read_scheduled_targets
+    if: github.event_name == 'schedule' && needs.read_scheduled_targets.outputs.matrix != '[]'
     strategy:
       fail-fast: false
       matrix:
-        target: ${{ fromJson(needs.read_scheduled_targets_controller.outputs.matrix) }}
-    uses: ./.github/workflows/monitor.yml # Calls this same workflow file
+        target: ${{ fromJson(needs.read_scheduled_targets.outputs.matrix) }}
+    uses: ./.github/workflows/reusable-scan-pipeline.yml
     with:
       environment_name: ${{ matrix.target }}
     secrets: inherit
-
-  # -----------------------------------------------------------------------------
-  # REUSABLE SCAN WORKFLOW
-  # -----------------------------------------------------------------------------
-  # This is the core, multi-job scan pipeline. It is only executed when called
-  # by one of the controller jobs above.
-  # -----------------------------------------------------------------------------
-
-  # Job 1: Discover and filter live subdomains.
-  discover-and-filter:
-    name: "Scan (${{ inputs.environment_name }}): Discover & Filter"
-    if: github.event_name == 'workflow_call'
-    runs-on: ubuntu-latest
-    environment: ${{ inputs.environment_name }}
-    outputs:
-      live_hosts_found: ${{ steps.check_file.outputs.found }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Set up Go
-        uses: actions/setup-go@v4
-        with:
-          go-version: '1.21'
-      - name: Install Discovery Tools
-        run: |
-          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-      - name: Discover and Filter Subdomains
-        id: discover
-        run: |
-          subfinder -d "${{ vars.TARGET_DOMAIN }}" -silent | httpx -silent -status-code -mc 200,301,302,307 -o live_subdomains.txt
-          echo "Found $(wc -l < live_subdomains.txt) live subdomains."
-      - name: Check if live hosts were found
-        id: check_file
-        run: |
-          if [ -s live_subdomains.txt ]; then
-            echo "found=true" >> $GITHUB_OUTPUT
-          else
-            echo "found=false" >> $GITHUB_OUTPUT
-            echo "No live subdomains found for ${{ vars.TARGET_DOMAIN }}. Stopping."
-          fi
-      - name: Upload live subdomains artifact
-        if: steps.check_file.outputs.found == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: live-subdomains-${{ inputs.environment_name }}-${{ github.run_id }}
-          path: live_subdomains.txt
-
-  # Job 2: Generate a dynamic matrix for parallel processing.
-  generate-matrix:
-    name: "Scan (${{ inputs.environment_name }}): Generate Matrix"
-    if: github.event_name == 'workflow_call' && needs.discover-and-filter.outputs.live_hosts_found == 'true'
-    runs-on: ubuntu-latest
-    environment: ${{ inputs.environment_name }}
-    needs: discover-and-filter
-    outputs:
-      matrix: ${{ steps.split.outputs.matrix }}
-    steps:
-      - name: Download live subdomains artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: live-subdomains-${{ inputs.environment_name }}-${{ github.run_id }}
-          path: .
-      - name: Split subdomains into chunks
-        id: split
-        run: |
-          mkdir -p chunks
-          split -d -l 50 live_subdomains.txt chunks/chunk_
-          MATRIX_JSON=$(ls -1q chunks/ | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          echo "matrix=${MATRIX_JSON}" >> $GITHUB_OUTPUT
-      - name: Upload subdomain chunks artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: subdomain-chunks-${{ inputs.environment_name }}-${{ github.run_id }}
-          path: chunks/
-
-  # Job 3: Scan and Process in Parallel.
-  scan-and-process:
-    name: "Scan (${{ inputs.environment_name }}): Process Chunk ${{ matrix.chunk_file }}"
-    if: github.event_name == 'workflow_call'
-    needs: generate-matrix
-    runs-on: ubuntu-latest
-    environment: ${{ inputs.environment_name }}
-    strategy:
-      fail-fast: false
-      matrix:
-        chunk_file: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Set up Go & Node
-        uses: actions/setup-go@v4
-        with:
-          go-version: '1.21'
-      - uses: actions/setup-node@v3
-        with:
-          node-version: '18'
-      - name: Install Scanning Tools
-        run: |
-          go install -v github.com/projectdiscovery/katana/cmd/katana@latest
-          go install -v github.com/lc/gau/v2/cmd/gau@latest
-          npm install -g js-beautify
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-      - name: Download subdomain chunks artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: subdomain-chunks-${{ inputs.environment_name }}-${{ github.run_id }}
-          path: chunks/
-      - name: Discover and Process JS files
-        env:
-          SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
-        run: |
-          CHUNK_FILE="chunks/${{ matrix.chunk_file }}"
-          KATANA_HEADER_ARGS=("-H" "User-Agent: Mozilla/5.0")
-          if [ -n "$SESSION_COOKIE" ]; then KATANA_HEADER_ARGS+=("-H" "Cookie: $SESSION_COOKIE"); fi
-          # Actively crawl the subdomains in this chunk
-          katana -list $CHUNK_FILE -jc -silent -d 5 -c 20 "${KATANA_HEADER_ARGS[@]}" -o katana-js.txt || true
-          # Find historical JS files for the root domain
-          gau --threads 5 --subs "${{ vars.TARGET_DOMAIN }}" | grep -iE '\.js$' | sort -u > gau-js.txt
-          cat katana-js.txt gau-js.txt | sort -u > all_js_urls.txt
-          OUTPUT_DIR="js_files_temp/runner_${{ matrix.chunk_file }}"
-          mkdir -p "$OUTPUT_DIR"
-          WGET_ARGS="--user-agent=Mozilla/5.0 --quiet --no-check-certificate"
-          if [ -n "$SESSION_COOKIE" ]; then WGET_ARGS="$WGET_ARGS --header=Cookie:$SESSION_COOKIE"; fi
-          process_url() {
-            url="$1"; if [ -z "$url" ]; then return; fi
-            safe_filename=$(echo "$url" | sed -e 's|https\?://||' -e 's|/|_|g' -e 's|?.*||' | tr -c 'a-zA-Z0-9._-' '_')
-            if [ -z "$safe_filename" ]; then return; fi
-            JS_FILE_PATH="$OUTPUT_DIR/$safe_filename.js"
-            if wget $WGET_ARGS --timeout=30 -O "$JS_FILE_PATH" "$url"; then
-              if [ -s "$JS_FILE_PATH" ]; then js-beautify -r "$JS_FILE_PATH" || true; fi
-            fi
-          }
-          export -f process_url; export WGET_ARGS; export OUTPUT_DIR
-          cat all_js_urls.txt | xargs -P 10 --no-run-if-empty -I {} bash -c 'process_url "$@"' _ {}
-      - name: Upload Processed JS files
-        uses: actions/upload-artifact@v4
-        with:
-          name: js-files-batch-${{ inputs.environment_name }}-${{ matrix.chunk_file }}-${{ github.run_id }}
-          path: js_files_temp/
-
-  # Job 4: Consolidate all results, commit changes, and notify.
-  consolidate:
-    name: "Scan (${{ inputs.environment_name }}): Consolidate & Notify"
-    needs: scan-and-process
-    if: always() && github.event_name == 'workflow_call' # Ensure this job runs even if parallel jobs fail, but only for workflow_calls
-    runs-on: ubuntu-latest
-    environment: ${{ inputs.environment_name }}
-    steps:
-      - name: Checkout Full Git History
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Download All JS File Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: all_js_files/
-          pattern: js-files-batch-${{ inputs.environment_name }}-*-${{ github.run_id }}
-          if-no-files-found: warn
-      - name: Consolidate JS Files
-        run: |
-          TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
-          mkdir -p "$TARGET_DIR"
-          if [ -d "all_js_files" ] && [ "$(ls -A all_js_files)" ]; then
-            find all_js_files -type f -name "*.js" -exec cp -n {} "$TARGET_DIR/" \;
-          fi
-      - name: Detect and Commit Changes
-        id: git_commit
-        run: |
-          TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
-          git config --global user.name "GitHub Action Bot"
-          git config --global user.email "action-bot@github.com"
-          git add -A "$TARGET_DIR/"
-          if git diff --staged --quiet; then
-            echo "changes_detected=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          git commit -m "[JS Scan] Update files for ${{ vars.TARGET_DOMAIN }}"
-          git pull origin main --rebase
-          git push origin main
-          echo "changes_detected=true" >> $GITHUB_OUTPUT
-          # Get the list of changed files for the analysis and notification
-          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD -- "$TARGET_DIR/")
-          echo "changed_files<<EOF" >> $GITHUB_OUTPUT
-          echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Analyze Changed Files
-        if: steps.git_commit.outputs.changes_detected == 'true'
-        run: |
-          echo "🐍 Setting up Python and installing analysis tools..."
-          sudo apt-get update && sudo apt-get install -y python3-pip yara
-          pip install git+https://github.com/m4ll0k/SecretFinder.git
-          pip install git+https://github.com/GerbenJavado/LinkFinder.git
-          chmod +x analyze_js.sh
-          echo "🔬 Analyzing changed files..."
-          echo "${{ steps.git_commit.outputs.changed_files }}" | ./analyze_js.sh
-
-      - name: Upload Analysis Results
-        if: steps.git_commit.outputs.changes_detected == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: analysis-results-${{ inputs.environment_name }}-${{ github.run_id }}
-          path: analysis_results/
-
-      - name: Send Notification on Change
-        if: steps.git_commit.outputs.changes_detected == 'true'
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          TARGET_DOMAIN: ${{ vars.TARGET_DOMAIN }}
-        run: |
-          chmod +x send_notification.sh
-          ./send_notification.sh

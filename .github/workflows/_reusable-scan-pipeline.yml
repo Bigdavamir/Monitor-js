@@ -184,7 +184,7 @@ jobs:
         with:
           path: all_js_files/
           pattern: js-files-batch-${{ inputs.environment_name }}-*-${{ github.run_id }}
-          if-no-files-found: warn
+          #if-no-files-found: warn
       - name: Consolidate JS Files and Index
         run: |
           TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"

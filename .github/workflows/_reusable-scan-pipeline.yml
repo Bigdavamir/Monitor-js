@@ -114,13 +114,13 @@ jobs:
         with:
           name: subdomain-chunks-${{ inputs.environment_name }}-${{ github.run_id }}
           path: chunks/
-      - name: Discover and Process JS files (Debug Mode)
+      - name: Discover and Process JS files
         env:
           SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
         run: |
           CHUNK_FILE="chunks/${{ matrix.chunk_file }}"
           
-          # DEBUG: Print the contents of the input file to ensure it's not empty.
+          # DEBUG: Print the contents of the input file.
           echo "--- DEBUG: Reading subdomains from ${CHUNK_FILE} ---"
           cat $CHUNK_FILE
           echo "----------------------------------------------------"
@@ -128,8 +128,7 @@ jobs:
           KATANA_HEADER_ARGS=("-H" "User-Agent: Mozilla/5.0")
           if [ -n "$SESSION_COOKIE" ]; then KATANA_HEADER_ARGS+=("-H" "Cookie: $SESSION_COOKIE"); fi
 
-          # Actively crawl the subdomains in this chunk for JS files.
-          # NOTE: Removed '|| true' to ensure the step fails if Katana has an error.
+          # Actively crawl the subdomains for JS files.
           katana -list $CHUNK_FILE -jc -silent -d 5 -c 20 "${KATANA_HEADER_ARGS[@]}" -o katana-js.txt
 
           # Find historical JS files for the subdomains in this chunk.
@@ -152,8 +151,10 @@ jobs:
           cat all_js_urls.txt
           echo "------------------------------------------------------------------"
 
-          # Now, call the original download script with the final list.
-          # If 'all_js_urls.txt' is empty, the script will do nothing, which is expected.
+          # FIX: Make the worker script executable before running it.
+          chmod +x monitor.sh
+
+          # Now, call the worker script with the final list of JS URLs.
           cat all_js_urls.txt | ./monitor.sh "${{ vars.TARGET_DOMAIN }}"
 
       - name: Upload Processed JS files
@@ -161,9 +162,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: js-files-batch-${{ inputs.environment_name }}-${{ matrix.chunk_file }}-${{ github.run_id }}
-          path: js_files_temp/
-          if-no-files-found: warn # Keep this to avoid errors if no files were downloaded
-
+          path: js_files_temp/** # Use wildcard to grab files from subdirectories
+          if-no-files-found: warn
 
   # Job 4: Consolidate all results, commit changes, and notify.
   consolidate:
@@ -182,7 +182,7 @@ jobs:
         with:
           path: all_js_files/
           pattern: js-files-batch-${{ inputs.environment_name }}-*-${{ github.run_id }}
-          #if-no-files-found: warn
+          if-no-files-found: warn
       - name: Consolidate JS Files and Index
         run: |
           TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
@@ -192,14 +192,14 @@ jobs:
           if [ -d "all_js_files" ] && [ "$(ls -A all_js_files)" ]; then
             # Copy all downloaded JS files, preserving existing ones to avoid overwriting.
             find all_js_files -type f -name "*.js" -exec cp -n {} "$TARGET_DIR/" \;
-            
+
             # Find all index.txt files, concatenate them into a temporary file.
             find all_js_files -type f -name "index.txt" -exec cat {} + >> "$TARGET_DIR/index.tmp"
-            
+
             if [ -f "$TARGET_DIR/index.tmp" ]; then
               # Merge the new index entries with the existing master index file (if it exists),
               # then sort and unique the result to create a clean, comprehensive index.
-              cat "$TARGET_DIR/index.tmp" "$TARGET_DIR/index.txt" 2>/null | sort -u > "$TARGET_DIR/index.final"
+              cat "$TARGET_DIR/index.tmp" "$TARGET_DIR/index.txt" 2>/dev/null | sort -u > "$TARGET_DIR/index.final"
               mv "$TARGET_DIR/index.final" "$TARGET_DIR/index.txt"
               rm "$TARGET_DIR/index.tmp"
               echo "✅ Index files consolidated."
@@ -235,7 +235,7 @@ jobs:
             echo "✅ No changed JS files to analyze, only other file types (e.g., index.txt) were updated."
             exit 0
           fi
-          
+
           echo "🐍 Setting up Python and installing analysis tools..."
           sudo apt-get update && sudo apt-get install -y python3-pip yara
           pip install git+https://github.com/m4ll0k/SecretFinder.git

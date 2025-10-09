@@ -121,23 +121,45 @@ jobs:
           CHUNK_FILE="chunks/${{ matrix.chunk_file }}"
           KATANA_HEADER_ARGS=("-H" "User-Agent: Mozilla/5.0")
           if [ -n "$SESSION_COOKIE" ]; then KATANA_HEADER_ARGS+=("-H" "Cookie: $SESSION_COOKIE"); fi
+          # Actively crawl the subdomains in this chunk for JS files.
           katana -list $CHUNK_FILE -jc -silent -d 5 -c 20 "${KATANA_HEADER_ARGS[@]}" -o katana-js.txt || true
-          gau --threads 5 --subs "${{ vars.TARGET_DOMAIN }}" | grep -iE '\.js$' | sort -u > gau-js.txt
+          # Find historical JS files for the subdomains in this chunk by piping them to gau.
+          cat $CHUNK_FILE | gau --threads 5 | grep -iE '\.js$' | sort -u > gau-js.txt
           cat katana-js.txt gau-js.txt | sort -u > all_js_urls.txt
           OUTPUT_DIR="js_files_temp/runner_${{ matrix.chunk_file }}"
           mkdir -p "$OUTPUT_DIR"
           WGET_ARGS="--user-agent=Mozilla/5.0 --quiet --no-check-certificate"
           if [ -n "$SESSION_COOKIE" ]; then WGET_ARGS="$WGET_ARGS --header=Cookie:$SESSION_COOKIE"; fi
+
+          # This function processes a single URL. It downloads the JS file using a
+          # hash-based filename to avoid "filename too long" errors and creates
+          # an index file to map hashes back to their original URLs.
           process_url() {
-            url="$1"; if [ -z "$url" ]; then return; fi
-            safe_filename=$(echo "$url" | sed -e 's|https\?://||' -e 's|/|_|g' -e 's|?.*||' | tr -c 'a-zA-Z0-9._-' '_')
-            if [ -z "$safe_filename" ]; then return; fi
-            JS_FILE_PATH="$OUTPUT_DIR/$safe_filename.js"
+            url="$1"
+            if [ -z "$url" ]; then return; fi
+
+            # Generate a fixed-length filename using the MD5 hash of the URL.
+            hashed_filename=$(echo -n "$url" | md5sum | awk '{print $1}').js
+            JS_FILE_PATH="$OUTPUT_DIR/$hashed_filename"
+
+            # Download the file, saving it to the hashed filename.
             if wget $WGET_ARGS --timeout=30 -O "$JS_FILE_PATH" "$url"; then
-              if [ -s "$JS_FILE_PATH" ]; then js-beautify -r "$JS_FILE_PATH" || true; fi
+              # If download is successful and the file is not empty, beautify it.
+              if [ -s "$JS_FILE_PATH" ]; then
+                js-beautify -r "$JS_FILE_PATH" || echo "⚠️ js-beautify failed on $JS_FILE_PATH"
+                # Record the mapping of the hash to the original URL in an index file.
+                echo "$hashed_filename,$url" >> "$OUTPUT_DIR/index.txt"
+              else
+                # If the downloaded file is empty, remove it to save space.
+                rm -f "$JS_FILE_PATH"
+              fi
+            else
+              echo "⚠️ Could not download: $url"
             fi
           }
+
           export -f process_url; export WGET_ARGS; export OUTPUT_DIR
+          # Process all found URLs in parallel.
           cat all_js_urls.txt | xargs -P 10 --no-run-if-empty -I {} bash -c 'process_url "$@"' _ {}
       - name: Upload Processed JS files
         uses: actions/upload-artifact@v4
@@ -163,13 +185,31 @@ jobs:
           path: all_js_files/
           pattern: js-files-batch-${{ inputs.environment_name }}-*-${{ github.run_id }}
           if-no-files-found: warn
-      - name: Consolidate JS Files
+      - name: Consolidate JS Files and Index
         run: |
           TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
           mkdir -p "$TARGET_DIR"
+
+          echo "Consolidating JS files and index maps..."
           if [ -d "all_js_files" ] && [ "$(ls -A all_js_files)" ]; then
+            # Copy all downloaded JS files, preserving existing ones to avoid overwriting.
             find all_js_files -type f -name "*.js" -exec cp -n {} "$TARGET_DIR/" \;
+
+            # Find all index.txt files, concatenate them into a temporary file.
+            find all_js_files -type f -name "index.txt" -exec cat {} + >> "$TARGET_DIR/index.tmp"
+
+            if [ -f "$TARGET_DIR/index.tmp" ]; then
+              # Merge the new index entries with the existing master index file (if it exists),
+              # then sort and unique the result to create a clean, comprehensive index.
+              cat "$TARGET_DIR/index.tmp" "$TARGET_DIR/index.txt" 2>/dev/null | sort -u > "$TARGET_DIR/index.final"
+              mv "$TARGET_DIR/index.final" "$TARGET_DIR/index.txt"
+              rm "$TARGET_DIR/index.tmp"
+              echo "✅ Index files consolidated."
+            fi
+          else
+            echo "No new files were downloaded by the scan jobs."
           fi
+          echo "✅ Consolidation complete."
       - name: Detect and Commit Changes
         id: git_commit
         run: |
@@ -192,13 +232,20 @@ jobs:
       - name: Analyze Changed Files
         if: steps.git_commit.outputs.changes_detected == 'true'
         run: |
+          CHANGED_JS_FILES=$(echo "${{ steps.git_commit.outputs.changed_files }}" | grep '\.js$' || true)
+          if [ -z "$CHANGED_JS_FILES" ]; then
+            echo "✅ No changed JS files to analyze, only other file types (e.g., index.txt) were updated."
+            exit 0
+          fi
+
           echo "🐍 Setting up Python and installing analysis tools..."
           sudo apt-get update && sudo apt-get install -y python3-pip yara
           pip install git+https://github.com/m4ll0k/SecretFinder.git
           pip install git+https://github.com/GerbenJavado/LinkFinder.git
           chmod +x analyze_js.sh
-          echo "🔬 Analyzing changed files..."
-          echo "${{ steps.git_commit.outputs.changed_files }}" | ./analyze_js.sh
+          echo "🔬 Analyzing changed JS files:"
+          echo "$CHANGED_JS_FILES"
+          echo "$CHANGED_JS_FILES" | ./analyze_js.sh
       - name: Upload Analysis Results
         if: steps.git_commit.outputs.changes_detected == 'true'
         uses: actions/upload-artifact@v4

@@ -1,6 +1,5 @@
-# This is the reusable workflow for the JS monitoring system.
-# It contains the core four-job scanning pipeline and is triggered by workflow_call.
-name: Reusable Scan Pipeline
+# Simplified Reusable Workflow for a Single Target Domain
+name: Reusable Scan Pipeline (Single Target)
 
 on:
   workflow_call:
@@ -13,94 +12,19 @@ on:
         required: false
       DISCORD_WEBHOOK_URL:
         required: false
-      # This secret is used as a fallback for git push if the default GITHUB_TOKEN fails.
-      REPO_PAT:
-        required: false
 
 jobs:
-  # Job 1: Discover and filter live subdomains.
-  discover-and-filter:
-    name: "Scan (${{ inputs.environment_name }}): Discover & Filter"
+  # This single job replaces the previous four-job chain.
+  scan-and-commit:
+    name: "Scan, Consolidate & Notify (${{ inputs.environment_name }})"
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment_name }}
-    outputs:
-      live_hosts_found: ${{ steps.check_file.outputs.found }}
     steps:
-      - name: Checkout code
+      - name: Checkout Full Git History
         uses: actions/checkout@v4
-      - name: Set up Go
-        uses: actions/setup-go@v4
         with:
-          go-version: '1.21'
-      - name: Install Discovery Tools
-        run: |
-          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-      - name: Discover and Filter Subdomains
-        id: discover
-        run: |
-          # FIX: Pipe httpx output through awk to remove status codes (e.g., "[200]")
-          # This ensures clean URLs are passed to the next jobs.
-          subfinder -d "${{ vars.TARGET_DOMAIN }}" -silent | httpx -silent -status-code -mc 200,301,302,307 | awk '{print $1}' > live_subdomains.txt
-          echo "Found $(wc -l < live_subdomains.txt) live subdomains."
-      - name: Check if live hosts were found
-        id: check_file
-        run: |
-          if [ -s live_subdomains.txt ]; then
-            echo "found=true" >> $GITHUB_OUTPUT
-          else
-            echo "found=false" >> $GITHUB_OUTPUT
-            echo "No live subdomains found for ${{ vars.TARGET_DOMAIN }}. Stopping."
-          fi
-      - name: Upload live subdomains artifact
-        if: steps.check_file.outputs.found == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: live-subdomains-${{ inputs.environment_name }}-${{ github.run_id }}
-          path: live_subdomains.txt
+          fetch-depth: 0 # Needed for git diff
 
-  # Job 2: Generate a dynamic matrix for parallel processing.
-  generate-matrix:
-    name: "Scan (${{ inputs.environment_name }}): Generate Matrix"
-    needs: discover-and-filter
-    if: needs.discover-and-filter.outputs.live_hosts_found == 'true'
-    runs-on: ubuntu-latest
-    environment: ${{ inputs.environment_name }}
-    outputs:
-      matrix: ${{ steps.split.outputs.matrix }}
-    steps:
-      - name: Download live subdomains artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: live-subdomains-${{ inputs.environment_name }}-${{ github.run_id }}
-          path: .
-      - name: Split subdomains into chunks
-        id: split
-        run: |
-          mkdir -p chunks
-          split -d -l 50 live_subdomains.txt chunks/chunk_
-          MATRIX_JSON=$(ls -1q chunks/ | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          echo "matrix=${MATRIX_JSON}" >> $GITHUB_OUTPUT
-      - name: Upload subdomain chunks artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: subdomain-chunks-${{ inputs.environment_name }}-${{ github.run_id }}
-          path: chunks/
-
-  # Job 3: Scan and Process in Parallel.
-  scan-and-process:
-    name: "Scan (${{ inputs.environment_name }}): Process Chunk ${{ matrix.chunk_file }}"
-    needs: generate-matrix
-    runs-on: ubuntu-latest
-    environment: ${{ inputs.environment_name }}
-    strategy:
-      fail-fast: false
-      matrix:
-        chunk_file: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
       - name: Set up Go & Node
         uses: actions/setup-go@v4
         with:
@@ -108,37 +32,41 @@ jobs:
       - uses: actions/setup-node@v3
         with:
           node-version: '18'
+
       - name: Install Scanning Tools
         run: |
           go install -v github.com/projectdiscovery/katana/cmd/katana@latest
           go install -v github.com/lc/gau/v2/cmd/gau@latest
           npm install -g js-beautify
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-      - name: Download subdomain chunks artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: subdomain-chunks-${{ inputs.environment_name }}-${{ github.run_id }}
-          path: chunks/
+          
+          # Install analysis tools
+          sudo apt-get update && sudo apt-get install -y python3-pip yara
+          pip install git+https://github.com/m4ll0k/SecretFinder.git
+          pip install git+https://github.com/GerbenJavado/LinkFinder.git
+
       - name: Discover and Process JS files
         env:
           SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
         run: |
-          CHUNK_FILE="chunks/${{ matrix.chunk_file }}"
-          # Actively crawl the subdomains in this chunk for JS files.
-          katana -list $CHUNK_FILE -jc -silent -d 5 -c 20 -o katana-js.txt || true
-          # Find historical JS files for the subdomains in this chunk.
-          cat $CHUNK_FILE | gau --threads 5 | grep -iE '\.js$' | sort -u > gau-js.txt
-          cat katana-js.txt gau-js.txt | sort -u > all_js_urls.txt
-          
-          echo "Total unique JS URLs found: $(wc -l < all_js_urls.txt)"
-          if [ ! -s all_js_urls.txt ]; then
-            echo "No JS URLs found for this chunk. Skipping download."
-            exit 0
-          fi
+          echo "Scanning single target: ${{ vars.TARGET_DOMAIN }}"
+          echo "${{ vars.TARGET_DOMAIN }}" > target.txt
 
-          OUTPUT_DIR="js_files_temp/runner_${{ matrix.chunk_file }}"
+          KATANA_HEADER_ARGS=("-H" "User-Agent: Mozilla/5.0")
+          if [ -n "$SESSION_COOKIE" ]; then KATANA_HEADER_ARGS+=("-H" "Cookie: $SESSION_COOKIE"); fi
+          
+          # Run discovery tools on the single domain
+          katana -list target.txt -jc -silent -d 5 -c 25 "${KATANA_HEADER_ARGS[@]}" -o katana-js.txt || true
+          cat target.txt | gau --threads 5 > gau-js.txt
+          
+          # Combine, sort, and strictly filter for .js files
+          cat katana-js.txt gau-js.txt | sort -u | grep -iE '\.js$' > all_js_urls.txt
+
+          echo "Found $(wc -l < all_js_urls.txt) unique JS URLs to process."
+          OUTPUT_DIR="js_files_temp"
           mkdir -p "$OUTPUT_DIR"
-          WGET_ARGS="--user-agent=Mozilla/5.0 --quiet --no-check-certificate"
+          
+          WGET_ARGS="--user-agent=Mozilla/5.0 --quiet --no-check-certificate --tries=2 --timeout=20 --dns-timeout=5 --read-timeout=15"
           if [ -n "$SESSION_COOKIE" ]; then WGET_ARGS="$WGET_ARGS --header=Cookie:$SESSION_COOKIE"; fi
 
           process_url() {
@@ -146,134 +74,66 @@ jobs:
             if [ -z "$url" ]; then return; fi
             hashed_filename=$(echo -n "$url" | md5sum | awk '{print $1}').js
             JS_FILE_PATH="$OUTPUT_DIR/$hashed_filename"
-            if wget $WGET_ARGS --timeout=30 -O "$JS_FILE_PATH" "$url"; then
+
+            if wget $WGET_ARGS -O "$JS_FILE_PATH" "$url"; then
               if [ -s "$JS_FILE_PATH" ]; then
                 js-beautify -r "$JS_FILE_PATH" || echo "⚠️ js-beautify failed on $JS_FILE_PATH"
                 echo "$hashed_filename,$url" >> "$OUTPUT_DIR/index.txt"
               else
                 rm -f "$JS_FILE_PATH"
               fi
-            else
-              echo "⚠️ Could not download: $url"
             fi
           }
-
           export -f process_url; export WGET_ARGS; export OUTPUT_DIR
-          cat all_js_urls.txt | xargs -P 10 --no-run-if-empty -I {} bash -c 'process_url "$@"' _ {}
-      - name: Upload Processed JS files
-        uses: actions/upload-artifact@v4
-        with:
-          name: js-files-batch-${{ inputs.environment_name }}-${{ matrix.chunk_file }}-${{ github.run_id }}
-          path: js_files_temp/
-          if-no-files-found: warn
+          cat all_js_urls.txt | xargs -P 25 --no-run-if-empty -I {} bash -c 'process_url "$@"' _ {}
 
-  # Job 4: Consolidate all results, commit changes, and notify.
-  consolidate:
-    name: "Scan (${{ inputs.environment_name }}): Consolidate & Notify"
-    needs: scan-and-process
-    if: always()
-    runs-on: ubuntu-latest
-    environment: ${{ inputs.environment_name }}
-    steps:
-      - name: Checkout Full Git History
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Download All JS File Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: all_js_files/
-          pattern: js-files-batch-${{ inputs.environment_name }}-*-${{ github.run_id }}
-          if-no-files-found: warn
-      - name: Consolidate JS Files and Index
+      - name: Consolidate and Commit Changes
+        id: git_commit
         run: |
           TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
           mkdir -p "$TARGET_DIR"
 
-          echo "Consolidating JS files and index maps..."
-          if [ -d "all_js_files" ] && [ "$(ls -A all_js_files)" ]; then
-            find all_js_files -type f -name "*.js" -exec cp -n {} "$TARGET_DIR/" \;
-            find all_js_files -type f -name "index.txt" -exec cat {} + >> "$TARGET_DIR/index.tmp"
-            if [ -f "$TARGET_DIR/index.tmp" ]; then
-              cat "$TARGET_DIR/index.tmp" "$TARGET_DIR/index.txt" 2>/dev/null | sort -u > "$TARGET_DIR/index.final"
-              mv "$TARGET_DIR/index.final" "$TARGET_DIR/index.txt"
-              rm "$TARGET_DIR/index.tmp"
-              echo "✅ Index files consolidated."
-            fi
-          else
-            echo "No new files were downloaded by the scan jobs."
+          # Use rsync to move new files and create the index
+          rsync -av js_files_temp/ "$TARGET_DIR/"
+
+          if [ -f "$TARGET_DIR/index.txt" ]; then
+             sort -u -o "$TARGET_DIR/index.txt" "$TARGET_DIR/index.txt"
           fi
-          echo "✅ Consolidation complete."
-      - name: Detect and Commit Changes
-        id: git_commit
-        env:
-          # The default token provided by the runner.
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # A fallback PAT stored in repository secrets.
-          REPO_PAT: ${{ secrets.REPO_PAT }}
-        run: |
-          TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
+
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action-bot@github.com"
           git add -A "$TARGET_DIR/"
-          
+
           if git diff --staged --quiet; then
-            echo "No changes to commit."
+            echo "No new JS files found for ${{ vars.TARGET_DOMAIN }}."
             echo "changes_detected=false" >> $GITHUB_OUTPUT
             exit 0
           fi
           
           git commit -m "[JS Scan] Update files for ${{ vars.TARGET_DOMAIN }}"
-          
-          # FIX: Try to push with the default token first. If it fails (exit code != 0),
-          # re-configure the remote with a PAT and try again.
-          set +e # Do not exit immediately on error
-          git pull origin main --rebase
-          git push origin main
-          PUSH_EXIT_CODE=$?
-          set -e # Re-enable exit on error
-          
-          if [ $PUSH_EXIT_CODE -ne 0 ]; then
-            echo "Push with GITHUB_TOKEN failed. Retrying with REPO_PAT."
-            if [ -z "$REPO_PAT" ]; then
-              echo "Error: REPO_PAT secret is not set. Cannot push changes."
-              exit 1
-            fi
-            git remote set-url origin https://x-access-token:${REPO_PAT}@github.com/${{ github.repository }}.git
-            git pull origin main --rebase
-            git push origin main
-          fi
-          
+          git push
           echo "changes_detected=true" >> $GITHUB_OUTPUT
-          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD -- "$TARGET_DIR/")
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD -- "$TARGET_DIR/")
           echo "changed_files<<EOF" >> $GITHUB_OUTPUT
           echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
-      - name: Analyze Changed Files
-        if: steps.git_commit.outputs.changes_detected == 'true'
-        run: |
-          CHANGED_JS_FILES=$(echo "${{ steps.git_commit.outputs.changed_files }}" | grep '\.js$' || true)
-          if [ -z "$CHANGED_JS_FILES" ]; then
-            echo "✅ No changed JS files to analyze."
-            exit 0
-          fi
-          chmod +x analyze_js.sh
-          echo "🔬 Analyzing changed JS files:"
-          echo "$CHANGED_JS_FILES"
-          echo "$CHANGED_JS_FILES" | ./analyze_js.sh
-      - name: Upload Analysis Results
-        if: steps.git_commit.outputs.changes_detected == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: analysis-results-${{ inputs.environment_name }}-${{ github.run_id }}
-          path: analysis_results/
-          if-no-files-found: ignore
-      - name: Send Notification on Change
+
+      - name: Analyze Changed Files & Notify
         if: steps.git_commit.outputs.changes_detected == 'true'
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           TARGET_DOMAIN: ${{ vars.TARGET_DOMAIN }}
         run: |
+          CHANGED_JS_FILES=$(echo "${{ steps.git_commit.outputs.changed_files }}" | grep '\.js$')
+          if [ -z "$CHANGED_JS_FILES" ]; then
+            echo "✅ No changed JS files to analyze."
+          else
+            echo "🔬 Analyzing changed JS files..."
+            chmod +x analyze_js.sh
+            echo "$CHANGED_JS_FILES" | ./analyze_js.sh
+          fi
+
+          echo "🚀 Notifying about changes..."
           chmod +x send_notification.sh
           ./send_notification.sh

@@ -18,7 +18,7 @@ jobs:
   # This job handles a single scan, triggered manually from the UI.
   manual_scan:
     if: github.event_name == 'workflow_dispatch'
-    uses: .github/workflows/reusable-scan-pipeline.yml@main # <-- FINAL FIX
+    uses: ./.github/workflows/_reusable-scan-pipeline.yml@main # <-- Filename corrected
     with:
       environment_name: ${{ github.event.inputs.target_environment }}
     secrets: inherit
@@ -40,6 +40,8 @@ jobs:
             echo "json=[]" >> $GITHUB_OUTPUT
             exit 0
           fi
+          # Ensure jq is installed
+          sudo apt-get install -y jq
           JSON_ARRAY=$(cat active_targets.txt | grep -vE '^\s*#|^\s*$' | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "json=${JSON_ARRAY}" >> $GITHUB_OUTPUT
           echo "Scheduled targets found: ${JSON_ARRAY}"
@@ -52,7 +54,7 @@ jobs:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.read_scheduled_targets.outputs.matrix) }}
-    uses: .github/workflows/reusable-scan-pipeline.yml@main # <-- FINAL FIX
+    uses: ./.github/workflows/_reusable-scan-pipeline.yml@main # <-- Filename corrected
     with:
       environment_name: ${{ matrix.target }}
     secrets: inherit

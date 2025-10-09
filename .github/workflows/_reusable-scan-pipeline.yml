@@ -35,16 +35,28 @@ jobs:
 
       - name: Install Scanning Tools
         run: |
+          # Install Go and Node tools
           go install -v github.com/projectdiscovery/katana/cmd/katana@latest
           go install -v github.com/lc/gau/v2/cmd/gau@latest
           npm install -g js-beautify
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
           
-          # Install analysis tools
-          sudo apt-get update && sudo apt-get install -y python3-pip yara
-          pip install git+https://github.com/m4ll0k/SecretFinder.git
+          # Install system analysis dependencies (add git)
+          sudo apt-get update && sudo apt-get install -y python3-pip yara git
+          
+          # Install LinkFinder (this one works correctly with pip)
           pip install git+https://github.com/GerbenJavado/LinkFinder.git
-
+          
+          # --- SECRETFINDER FIX ---
+          # SecretFinder is not a standard pip package and must be cloned manually.
+          echo "Cloning SecretFinder repository..."
+          git clone https://github.com/m4ll0k/SecretFinder.git /opt/secretfinder
+          echo "Installing SecretFinder dependencies from its requirements.txt..."
+          pip install -r /opt/secretfinder/requirements.txt
+          echo "Adding SecretFinder directory to the system PATH..."
+          echo "/opt/secretfinder" >> $GITHUB_PATH
+          # --- END OF FIX ---
+          
       - name: Discover and Process JS files
         env:
           SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}

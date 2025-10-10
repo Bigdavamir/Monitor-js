@@ -1,4 +1,4 @@
-# Reusable JS Scan Pipeline - Optimized Single-Job Workflow
+# Reusable JS Scan Pipeline - Optimized Single-Job Workflow (Advanced Deduplication)
 name: Reusable Scan Pipeline (Single Target)
 
 on:
@@ -14,16 +14,16 @@ on:
         required: false
 
 jobs:
-  # This single job handles the entire process: scanning, processing, consolidating, committing, and notifying.
+  # This single job handles the entire process with clear, separate steps.
   scan-and-commit:
     name: "Scan, Consolidate & Notify (${{ inputs.environment_name }})"
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment_name }}
     steps:
-      - name: Checkout Full Git History
+      - name: Checkout Full Git History and Assets
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Required for git diff to compare against previous commits
+          fetch-depth: 0 # Required for git diff and for accessing filter files.
 
       - name: Set up Go, Node & System Tools
         uses: actions/setup-go@v4
@@ -36,101 +36,117 @@ jobs:
       - name: Install All Dependencies
         run: |
           echo "Installing system packages..."
-          # Install jq for JSON processing, yara for analysis, and git.
           sudo apt-get update && sudo apt-get install -y python3-pip yara git jq
 
           echo "Installing Go and Node tools..."
           go install -v github.com/projectdiscovery/katana/cmd/katana@latest
           go install -v github.com/lc/gau/v2/cmd/gau@latest
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
           npm install -g js-beautify
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
           
           echo "Installing Python analysis tools..."
           pip install git+https://github.com/GerbenJavado/LinkFinder.git
           
-          # SecretFinder requires manual cloning as it's not a standard pip package.
           git clone https://github.com/m4ll0k/SecretFinder.git /opt/secretfinder
           pip install -r /opt/secretfinder/requirements.txt
           echo "/opt/secretfinder" >> $GITHUB_PATH
           echo "✅ All dependencies installed."
 
-      - name: Discover and Process JS Files
+      - name: Discover and Process JS Files (with Content Hashing)
+        id: process_js
         env:
           SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
         run: |
           echo "🎯 Starting scan for target: ${{ vars.TARGET_DOMAIN }}"
           echo "${{ vars.TARGET_DOMAIN }}" > target.txt
 
-          KATANA_HEADER_ARGS=("-H" "User-Agent: Mozilla/5.0")
-          if [ -n "$SESSION_COOKIE" ]; then KATANA_HEADER_ARGS+=("-H" "Cookie: $SESSION_COOKIE"); fi
+          # --- URL Discovery Phase ---
+          katana -list target.txt -jc -silent -d 5 -c 25 -H "User-Agent: Mozilla/5.0" -o katana-out.txt || true
+          cat target.txt | gau --threads 5 | grep -iE "^https?://(www\.)?${{ vars.TARGET_DOMAIN }}/" > gau-out.txt
+          cat katana-out.txt gau-out.txt | sort -u > all_urls.txt
           
-          katana -list target.txt -jc -silent -d 5 -c 25 "${KATANA_HEADER_ARGS[@]}" -o katana-js.txt || true
-          
-          # Run gau and immediately filter for the exact target domain to avoid subdomain scope creep.
-          cat target.txt | gau --threads 5 | grep -iE "^https?://(www\.)?${{ vars.TARGET_DOMAIN }}/" > gau-js.txt
-
-          cat katana-js.txt gau-js.txt | sort -u > all_urls.txt
-          
-          # Method 1: Get URLs ending in .js (with optional query parameters)
           grep -iE '\.js($|\?)' all_urls.txt > all_js_urls.txt
-
-          # Method 2: Probe remaining URLs to find JS files by Content-Type.
-          grep -ivE '\.js($|\?)' all_urls.txt | httpx -silent -threads 25 -json -o probed.json || true
+          grep -ivE '\.js($|\?)' all_urls.txt | httpx -silent -threads 25 -H "User-Agent: Mozilla/5.0" -json -o probed.json || true
           if [ -s probed.json ]; then
-            jq -r 'select(.content_type != null and (.content_type | test("javascript|x-javascript|text/javascript|application/ecmascript"))) .url' probed.json >> all_js_urls.txt
+            jq -r 'select(.content_type != null and (.content_type | test("javascript|x-javascript"))) .url' probed.json >> all_js_urls.txt
           fi
-
-          # Final deduplication of found JS URLs
           sort -u -o all_js_urls.txt all_js_urls.txt
-
           JS_COUNT=$(wc -l < all_js_urls.txt)
-          echo "✅ Found $JS_COUNT unique JS URLs. Proceeding to download."
-          
-          OUTPUT_DIR="js_files_temp"
-          mkdir -p "$OUTPUT_DIR"
+          echo "✅ Found $JS_COUNT unique JS URLs. Proceeding to download and process."
+          echo "js_url_count=$JS_COUNT" >> $GITHUB_OUTPUT
+
+          # --- Advanced Processing Setup ---
+          TEMP_DIR="js_files_temp"
+          mkdir -p "$TEMP_DIR"
           
           WGET_ARGS="--user-agent=Mozilla/5.0 --quiet --no-check-certificate --tries=2 --timeout=20"
           if [ -n "$SESSION_COOKIE" ]; then WGET_ARGS="$WGET_ARGS --header=Cookie:$SESSION_COOKIE"; fi
+          
+          LIBS_IGNORE_FILE="libs-ignore.txt"
+          LIBS_HASHES_FILE="libs_hashes.txt"
 
+          # --- Core Processing Function (SHA256 Content-Based) ---
           process_url() {
             url="$1"
             [ -z "$url" ] && return
-            hashed_filename=$(echo -n "$url" | md5sum | awk '{print $1}').js
-            JS_FILE_PATH="$OUTPUT_DIR/$hashed_filename"
+            
+            # Layer 1 Filter: Ignore based on URL pattern from libs-ignore.txt
+            if [ -f "$LIBS_IGNORE_FILE" ] && grep -qf "$LIBS_IGNORE_FILE" <<< "$url"; then return; fi
 
-            if wget $WGET_ARGS -O "$JS_FILE_PATH" "$url"; then
-              if [ -s "$JS_FILE_PATH" ]; then
-                js-beautify -r "$JS_FILE_PATH" &>/dev/null || echo "⚠️ js-beautify failed on $JS_FILE_PATH"
-                echo "$hashed_filename,$url" >> "$OUTPUT_DIR/index.txt"
+            TEMP_FILE=$(mktemp)
+            if wget $WGET_ARGS -O "$TEMP_FILE" "$url" && [ -s "$TEMP_FILE" ]; then
+              CONTENT_HASH=$(sha256sum "$TEMP_FILE" | awk '{print $1}')
+              [ -z "$CONTENT_HASH" ] && { rm -f "$TEMP_FILE"; return; }
+              
+              # Layer 2 Filter: Ignore based on content hash from libs_hashes.txt
+              if [ -f "$LIBS_HASHES_FILE" ] && grep -qF "$CONTENT_HASH" "$LIBS_HASHES_FILE"; then { rm -f "$TEMP_FILE"; return; }; fi
+
+              FINAL_JS_PATH="$TEMP_DIR/${CONTENT_HASH}.js"
+              
+              # Deduplication: Only beautify and move if we haven't seen this content before.
+              if [ ! -f "$FINAL_JS_PATH" ]; then
+                js-beautify -r "$TEMP_FILE" &>/dev/null
+                mv "$TEMP_FILE" "$FINAL_JS_PATH"
               else
-                rm -f "$JS_FILE_PATH"
+                rm -f "$TEMP_FILE" # Content already exists, discard download.
               fi
+              
+              # Always record the URL-to-content mapping.
+              echo "${CONTENT_HASH}.js,$url" >> "$TEMP_DIR/manifest.csv"
+            else
+              rm -f "$TEMP_FILE" # Cleanup failed or empty download.
             fi
           }
-          export -f process_url; export WGET_ARGS; export OUTPUT_DIR
+          export -f process_url; export WGET_ARGS; export TEMP_DIR; export LIBS_IGNORE_FILE; export LIBS_HASHES_FILE
+          
           cat all_js_urls.txt | xargs -P 25 --no-run-if-empty -I {} bash -c 'process_url "$@"' _ {}
 
-      - name: Consolidate JS Files and Index
+      - name: Consolidate JS Files and Manifest
         run: |
-          TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
+          TARGET_BASE_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
+          TARGET_FILES_DIR="$TARGET_BASE_DIR/files"
+          TARGET_MANIFEST="$TARGET_BASE_DIR/manifest.csv"
           TEMP_DIR="js_files_temp"
-          mkdir -p "$TARGET_DIR"
+          
+          mkdir -p "$TARGET_FILES_DIR"
 
           echo "Consolidating downloaded files..."
-          # If no files were downloaded, there's nothing to do.
           if [ ! -d "$TEMP_DIR" ] || [ -z "$(ls -A $TEMP_DIR)" ]; then
             echo "No new files were downloaded. Nothing to consolidate."
             exit 0
           fi
           
-          # Copy new JS files, but do not overwrite existing ones.
-          find "$TEMP_DIR" -type f -name "*.js" -exec cp -n {} "$TARGET_DIR/" \;
+          # Copy new JS files, but do not overwrite existing ones. This is the core of deduplication.
+          find "$TEMP_DIR" -type f -name "*.js" -exec cp -n {} "$TARGET_FILES_DIR/" \;
 
-          # Smartly merge the new index with the existing master index, then sort and unique the result.
-          if [ -f "$TEMP_DIR/index.txt" ]; then
-            cat "$TEMP_DIR/index.txt" "$TARGET_DIR/index.txt" 2>/dev/null | sort -u > "$TARGET_DIR/index.final"
-            mv "$TARGET_DIR/index.final" "$TARGET_DIR/index.txt"
-            echo "✅ Index file updated."
+          # Smartly merge the new manifest with the existing master manifest.
+          if [ -f "$TEMP_DIR/manifest.csv" ]; then
+            # Combine new and old manifest, then sort and unique based on the URL (second column)
+            # to prevent multiple entries for the same URL pointing to the same hash.
+            cat "$TEMP_DIR/manifest.csv" "$TARGET_MANIFEST" 2>/dev/null | sort -u -t, -k2,2 > "${TARGET_MANIFEST}.final"
+            mv "${TARGET_MANIFEST}.final" "$TARGET_MANIFEST"
+            echo "✅ Manifest file updated."
           fi
           
           rm -rf "$TEMP_DIR"
@@ -139,13 +155,12 @@ jobs:
       - name: Detect and Commit Changes
         id: git_commit
         run: |
-          TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
+          TARGET_BASE_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action-bot@github.com"
 
-          git add -A "$TARGET_DIR/"
+          git add -A "$TARGET_BASE_DIR/"
 
-          # Exit if there are no staged changes to commit.
           if git diff --staged --quiet; then
             echo "✅ No changes detected in the repository. Workflow finished successfully."
             echo "changes_detected=false" >> $GITHUB_OUTPUT
@@ -163,8 +178,7 @@ jobs:
           
           echo "changes_detected=true" >> $GITHUB_OUTPUT
           
-          # Capture the list of changed files for the analysis step.
-          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD -- "$TARGET_DIR/")
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD -- "$TARGET_BASE_DIR/")
           echo "changed_files<<EOF" >> $GITHUB_OUTPUT
           echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -176,19 +190,16 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           TARGET_DOMAIN: ${{ vars.TARGET_DOMAIN }}
         run: |
-          # The list of changed files comes from the previous step's output.
           CHANGED_FILES="${{ steps.git_commit.outputs.changed_files }}"
           
-          # Filter for only .js files to analyze.
           CHANGED_JS_FILES=$(echo "$CHANGED_FILES" | grep '\.js$' || true)
           
           if [ -n "$CHANGED_JS_FILES" ]; then
             echo "🔬 Analyzing changed JS files..."
             chmod +x analyze_js.sh
-            # Pipe the list of changed JS files directly to the analysis script.
             echo "$CHANGED_JS_FILES" | ./analyze_js.sh
           else
-            echo "✅ No changed JS files to analyze, only other file types (e.g., index.txt) were updated."
+            echo "✅ No changed JS files to analyze, only manifest or other files were updated."
           fi
 
           echo "🚀 Sending notification..."

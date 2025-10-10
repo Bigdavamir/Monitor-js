@@ -1,2 +1,0 @@
-"use strict";(self.bxpChunk=self.bxpChunk||[]).push([[8331],{85473:(o,r,s)=>{var l=s(65311);l(document).ready((function(){var o=0,r=l(window),s=l(".modular-social-bar");r.on("scroll",(function(){var l=r.scrollTop();s.toggleClass("hidden",l>o),o=l}))}))},65311:o=>{o.exports=jQuery}},o=>{var r=r=>o(o.s=r);r(85813),r(85473)}]);
-//# sourceMappingURL=/static/master/10080/assets/build/js/ad-hoc/software-development-hub/software-hub.js.map

@@ -1,1 +1,0 @@
-(function(){const b={km:new Map,format:WRM.format,getText(a,...c){b.km.has(a)||console.debug(`No translation found for '${a}'. Have you included the "jsI18n" transformation in your web-resource configuration?`);a=b.km.get(a)||a;return b.format.apply(null,[a,...c])}};"function"===typeof define&&define("wrm/i18n",()=>b);WRM.I18n=b;AJS.I18n=b})();

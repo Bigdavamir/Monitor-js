@@ -1,1 +1,0 @@
-!function(){"use strict";let r=window;const n=r.WRM;let i=0,l=0,t=null;function e(){i===l&&t&&(t(),t=null)}const c={install(r){i+=1,r((()=>{l+=1,e()}))}};r["browser-metrics-plugin"]=c,n.require(["wrc!browser-metrics-plugin.contrib"],(()=>{r.require(["internal/browser-metrics-plugin/collector"],(r=>{t=()=>{r.install()},e()}))}))}();

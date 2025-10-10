@@ -1,0 +1,18 @@
+    # Analytics & Trackers
+    google-analytics.com
+    googletagmanager.com
+    analytics.js
+    gtm.js
+    
+    # Common CDNs and Libraries
+    jquery
+    jquery.min.js
+    bootstrap
+    react.js
+    react-dom.js
+    vue.js
+    moment.js
+    
+    # Ad Networks
+    doubleclick.net
+    googlesyndication.com

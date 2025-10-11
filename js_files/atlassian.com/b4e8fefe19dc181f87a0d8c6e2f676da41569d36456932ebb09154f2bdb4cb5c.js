@@ -1,1 +1,0 @@
-window.AtlOneTrustWrapper.setGCM(window.OnetrustActiveGroups);

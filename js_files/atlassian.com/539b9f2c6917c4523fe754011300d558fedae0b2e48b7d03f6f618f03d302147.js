@@ -1,1 +1,0 @@
- window.cmsPageVariant = window.cmsPageVariant ? window.cmsPageVariant : window.featureFlags?.cmsVariant; 

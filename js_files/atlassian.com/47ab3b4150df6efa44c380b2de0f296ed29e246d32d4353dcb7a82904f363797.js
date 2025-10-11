@@ -1,1 +1,0 @@
- loadExternalJS("https://atl-global.atlassian.com/js/atl-global.min.js", document.body, initializeATLAnalytics); 

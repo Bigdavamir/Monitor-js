@@ -1,1 +1,0 @@
- window.featureFlags = "loadOneTrust=true".split('&amp;') .reduce((flags, flagStr) => { const [flagKey, flagValue] = flagStr.split('='); return { ...flags, [flagKey]: flagValue }; }, {}) 

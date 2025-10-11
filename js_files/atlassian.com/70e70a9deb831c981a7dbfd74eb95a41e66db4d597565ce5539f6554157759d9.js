@@ -1,1 +1,0 @@
- { "type":"imkt.components.FeatureFlaggerContainer", "params": { "flagKey":"gwp-6073-dreamdata-gate", "flagType":"gate", "flagParameter":"variantName", "flagValueType":"boolean", "flagDefaultValue":"false", "contentType":"script" } } 

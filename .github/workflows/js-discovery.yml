@@ -1,4 +1,5 @@
-name: JS Discovery Workflow
+# .github/workflows/playwright-js-monitor.yml
+name: JS Monitor - Playwright Edition
 
 on:
   workflow_dispatch:
@@ -7,153 +8,190 @@ on:
 
 jobs:
   discover-and-filter:
+    name: "Discover & Filter Subdomains"
     runs-on: ubuntu-latest
     outputs:
-      found_hosts: ${{ steps.check_output.outputs.found_hosts }}
+      live_hosts_found: ${{ steps.check_file.outputs.found }}
     steps:
-      - name: Check out repository
+      - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Install Dependencies
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+      - name: Install Discovery Tools
         run: |
-          sudo apt-get update && sudo apt-get install -y wget
           go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
       - name: Discover and Filter Subdomains
-        id: discover_step
         run: |
-          TARGET_DOMAIN="${{ vars.TARGET_DOMAIN }}"
-          echo "Discovering subdomains for $TARGET_DOMAIN"
-          ~/go/bin/subfinder -d "$TARGET_DOMAIN" -silent | ~/go/bin/httpx -status-code -mc 200,301,302,307 -silent > live_subdomains.txt
-
-      - name: Check for Output
-        id: check_output
+          subfinder -d "${{ vars.TARGET_DOMAIN }}" -silent | httpx -silent -status-code -mc 200,301,302,307 -o live_subdomains.txt
+      - name: Check if live hosts were found
+        id: check_file
         run: |
           if [ -s live_subdomains.txt ]; then
-            echo "found_hosts=true" >> $GITHUB_OUTPUT
-            echo "Live subdomains found. Proceeding to the next job."
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "Found $(wc -l < live_subdomains.txt) live subdomains."
           else
-            echo "found_hosts=false" >> $GITHUB_OUTPUT
-            echo "No live subdomains found. Skipping the next jobs."
+            echo "found=false" >> $GITHUB_OUTPUT
           fi
-
-      - name: Upload Live Subdomains Artifact
-        if: steps.check_output.outputs.found_hosts == 'true'
+      - name: Upload live subdomains artifact
+        if: steps.check_file.outputs.found == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: live-subdomains
+          name: live-subdomains-${{ github.run_id }}
           path: live_subdomains.txt
 
   generate-matrix:
+    name: "Generate Parallel Matrix"
     needs: discover-and-filter
-    if: needs.discover-and-filter.outputs.found_hosts == 'true'
+    if: needs.discover-and-filter.outputs.live_hosts_found == 'true'
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      matrix: ${{ steps.split.outputs.matrix }}
     steps:
-      - name: Download Live Subdomains Artifact
+      - name: Download live subdomains artifact
         uses: actions/download-artifact@v4
         with:
-          name: live-subdomains
-          path: .
-
-      - name: Generate Matrix
-        id: set-matrix
+          name: live-subdomains-${{ github.run_id }}
+      - name: Split subdomains into chunks
+        id: split
         run: |
-          split -l 50 live_subdomains.txt chunk_
-          ls chunk_* > chunks.txt
-          MATRIX=$(jq -R -s -c 'split("\n") | map(select(length > 0))' chunks.txt)
-          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-
-      - name: Upload Chunks Artifact
+          mkdir -p chunks
+          split -d -l 25 live_subdomains.txt chunks/chunk_
+          MATRIX_JSON=$(ls -1q chunks/ | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "matrix=${MATRIX_JSON}" >> $GITHUB_OUTPUT
+      - name: Upload subdomain chunks artifact
         uses: actions/upload-artifact@v4
         with:
-          name: subdomain-chunks
-          path: chunk_*
+          name: subdomain-chunks-${{ github.run_id }}
+          path: chunks/
 
-  extract-js-with-playwright:
+  extract-js:
+    name: "Extract JS (Chunk ${{ matrix.chunk_file }})"
     needs: generate-matrix
-    if: needs.generate-matrix.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        chunk: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+        chunk_file: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
     steps:
-      - name: Check out repository
+      - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v3
         with:
           node-version: '18'
-
-      - name: Install Playwright
+      - name: Install Playwright and dependencies
         run: npx playwright install --with-deps chromium
-
-      - name: Download Chunks Artifact
+      - name: Download subdomain chunk
         uses: actions/download-artifact@v4
         with:
-          name: subdomain-chunks
-          path: .
-
-      - name: Extract JS Files
+          name: subdomain-chunks-${{ github.run_id }}
+          path: chunks/
+      - name: Run Playwright JS Extraction
         run: |
-          mkdir -p captured_js/
-          while IFS= read -r url; do
-            echo "Processing $url"
-            node extract-js.js "$url"
-          done < "${{ matrix.chunk }}"
-
-      - name: Upload Captured JS Artifact
+          CHUNK_FILE="chunks/${{ matrix.chunk_file }}"
+          while IFS= read -r host; do
+            echo "Crawling: $host"
+            # The node script will create the 'captured_js' directory
+            node extract-js.js "$host"
+          done < "$CHUNK_FILE"
+      - name: Upload Captured JS Files
         uses: actions/upload-artifact@v4
         with:
-          name: captured-js-${{ matrix.chunk }}
+          name: captured-js-${{ matrix.chunk_file }}-${{ github.run_id }}
           path: captured_js/
+          if-no-files-found: ignore
 
   consolidate-and-commit:
-    needs: extract-js-with-playwright
+    name: "Consolidate, Deduplicate & Commit"
+    needs: extract-js
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
+      - name: Checkout Full Git History
         uses: actions/checkout@v4
-
-      - name: Download All Captured JS Artifacts
+        with:
+          fetch-depth: 0
+      - name: Download all JS artifacts
         uses: actions/download-artifact@v4
         with:
-          name: captured-js-*
-          path: all_captured_js/
+          path: all_js_artifacts/
+          pattern: captured-js-*-${{ github.run_id }}
+          if-no-files-found: warn
 
-      - name: Consolidate and Commit
+      - name: Consolidate, Deduplicate, and Prepare Commit
+        id: process_files
         run: |
           TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
           mkdir -p "$TARGET_DIR"
+          MASTER_INDEX_FILE="$TARGET_DIR/index.csv"
+          touch "$MASTER_INDEX_FILE"
+          
+          NEW_FILES_SUMMARY="new_files_summary.log"
+          
+          if [ ! -d "all_js_artifacts" ] || [ -z "$(ls -A all_js_artifacts)" ]; then
+            echo "No JS files were captured in this run."
+            echo "changes_detected=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
-          find all_captured_js -type f -name "*.js" | while read -r file; do
-            HASH=$(basename "$file" .js)
-            URL=$(head -n 1 "$file")
-
-            if [ ! -f "$TARGET_DIR/$HASH.js" ]; then
-              echo "New JS file found: $HASH from $URL"
-              tail -n +2 "$file" > "$TARGET_DIR/$HASH.js"
-              echo "$HASH,$URL,$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$TARGET_DIR/index.csv"
-
-              if [ -f "./send_notification.sh" ]; then
-                ./send_notification.sh "$HASH" "$URL"
-              fi
+          # Process all found JS files and their corresponding index files
+          find all_js_artifacts -type f -name "*.js" | while read -r js_file; do
+            HASH=$(basename "$js_file" .js)
+            
+            # Check if this hash is already in the master index
+            if ! grep -q "^$HASH," "$MASTER_INDEX_FILE"; then
+              # Find the URL from the temporary index file in the same directory
+              INDEX_FILE=$(dirname "$js_file")/index.txt
+              URL=$(grep "^$HASH," "$INDEX_FILE" | cut -d, -f2-)
+              
+              echo "New file found: Hash $HASH from URL $URL"
+              cp "$js_file" "$TARGET_DIR/$HASH.js"
+              echo "$HASH,$URL,$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$MASTER_INDEX_FILE"
+              echo "✅ New JS: $URL" >> $NEW_FILES_SUMMARY
             fi
           done
+          
+          # Check if new files were found
+          if [ ! -f "$NEW_FILES_SUMMARY" ]; then
+            echo "No new JS files detected."
+            echo "changes_detected=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "changes_detected=true" >> $GITHUB_OUTPUT
+          # Make the summary available for the notification step
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          cat $NEW_FILES_SUMMARY >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Commit Changes
+        if: steps.process_files.outputs.changes_detected == 'true'
         run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git config --global user.name "GitHub Action Bot"
+          git config --global user.email "action-bot@github.com"
+          # Sort the index file to prevent noisy diffs
+          sort -u -o "${{ vars.TARGET_DOMAIN }}/index.csv" "${{ vars.TARGET_DOMAIN }}/index.csv"
           git add "js_files/"
-          if git diff --staged --quiet; then
-            echo "No changes to commit."
+          git commit -m "JS Scan: Update files for ${{ vars.TARGET_DOMAIN }}"
+          git pull origin main --rebase
+          git push
+
+      - name: Send Notification on Change
+        if: steps.process_files.outputs.changes_detected == 'true'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SUMMARY_CONTENT: ${{ steps.process_files.outputs.summary }}
+        run: |
+          # Your existing send_notification.sh can be used, or a simple curl:
+          # This sends ONE notification with the summary of ALL new files.
+          if [ -n "$DISCORD_WEBHOOK_URL" ]; then
+            curl -X POST -H "Content-Type: application/json" \
+            -d "{\"content\": \"🔎 **New JavaScript Files Detected for `${{ vars.TARGET_DOMAIN }}`**\n\`\`\`\n${SUMMARY_CONTENT}\n\`\`\`\"}" \
+            "$DISCORD_WEBHOOK_URL"
           else
-            git commit -m "Update JS files for ${{ vars.TARGET_DOMAIN }}"
-            git push
+            echo "Discord webhook URL not set. Skipping notification."
           fi

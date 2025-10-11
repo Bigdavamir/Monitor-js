@@ -22,61 +22,49 @@ env:
 
 jobs:
   discover_urls:
-    name: "Discover JS URLs with Headless Katana (${{ inputs.environment_name }})"
     runs-on: ubuntu-latest
     outputs:
-      js_count: ${{ steps.count.outputs.count }}
+      js_urls_count: ${{ steps.count.outputs.count }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Normalize target
+      - name: Normalize target domain name
         id: set-domain
         run: |
-          DOMAIN="${{ inputs.environment_name }}"
-          TARGET_DOMAIN=$(echo "$DOMAIN" | sed 's/-com$/.com/')
+          # Removes protocol and trailing slashes for clean directory names
+          TARGET_DOMAIN=$(echo "${{ inputs.environment_name }}" | sed -E 's,^https?://,,; s,/$,,')
           echo "target_domain=$TARGET_DOMAIN" >> $GITHUB_OUTPUT
 
       - name: Setup Go & Node
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
-      - uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: '18'
+      - run: go version
+      - run: node --version
 
+      # FIX 3: Correctly cache Go binaries instead of looking for go.sum
       - name: Cache Go/Node/Pip & Chrome
         uses: actions/cache@v4
         with:
           path: |
             ~/.cache/go-build
-            ${{ env.GOPATH }}/pkg/mod
-            ${{ env.GOPATH }}/bin
+            ~/go/bin
             ~/.npm
             ~/.cache/pip
-            /opt/google/chrome
-          key: ${{ runner.os }}-tool-cache-v2 # Incremented key for new cache contents
+            ~/.cache/google-chrome
+          key: ${{ runner.os }}-go-node-pip-chrome-${{ hashFiles('**/go.mod', '**/go.sum', '**/package-lock.json', '**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-go-node-pip-chrome-
 
       - name: Install Tools & Google Chrome
         run: |
-          # Install Chrome for headless crawling if not cached
-          if ! command -v google-chrome-stable &> /dev/null
-          then
-            echo "Google Chrome not found, installing..."
-            wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O chrome.deb
-            sudo dpkg -i chrome.deb
-            sudo apt-get install -f -y # Install dependencies
-            rm chrome.deb
-          else
-            echo "Google Chrome is already installed (from cache)."
-          fi
-          
-          # Install Go-based tools
+          sudo apt-get update && sudo apt-get install -y libpcre3-dev
           go install -v github.com/projectdiscovery/katana/cmd/katana@latest
           go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+          wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt install -y ./google-chrome-stable_current_amd64.deb
+          npm install -g js-beautify
 
       - name: Crawl with Headless Katana and Probe JS URLs
         id: count
@@ -84,29 +72,31 @@ jobs:
           SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
         run: |
           TARGET_DOMAIN="${{ steps.set-domain.outputs.target_domain }}"
-          echo "🚀 Starting headless discovery for: $TARGET_DOMAIN"
+          echo "🚀 Starting Headless discovery for: $TARGET_DOMAIN"
           
-          # Step 1: Crawl the root domain and its subdomains with headless Katana
-          # -cs: Crawl subdomains
-          # -headless: Run a full browser to render JS and find dynamic URLs
-          # -sc: Use the system-installed Chrome
-          # -jc: Only output Javascript file URLs
-          echo "Crawling with Headless Katana to find all static and dynamic JS files..."
-          KATANA_ARGS=("-u" "$TARGET_DOMAIN" "-cs" "-silent" "-jc" "-d" "3" "-c" "10" "-headless" "-sc")
+          # FIX 1: Add generous timeouts for complex sites and adjust concurrency
+          KATANA_ARGS=(
+            "-u" "$TARGET_DOMAIN"
+            "-silent"
+            "-jc"               # Extract JS files only
+            "-d" "3"            # Max depth
+            "-c" "8"            # Concurrency (slightly reduced)
+            "-headless"
+            "-sc"               # Use installed chrome
+            "-timeout" "180"    # Main timeout for the entire crawl (3 minutes)
+            "-hht" "120"        # Headless-specific operations timeout (2 minutes)
+          )
           if [ -n "$SESSION_COOKIE" ]; then
             KATANA_ARGS+=("-hH" "Cookie: $SESSION_COOKIE")
           fi
           
-          # We no longer need grep because -jc already filters for JS URLs
           katana "${KATANA_ARGS[@]}" > candidate_js_urls.txt
-          
-          # Step 2: Probe candidate URLs to ensure they are live (200 OK)
-          echo "Probing candidate JS URLs to verify they are live..."
-          cat candidate_js_urls.txt | httpx -silent -mc 200 -threads ${{ env.JS_PROBE_THREADS }} > js_urls.txt
 
-          # Step 3: Final count and output
+          echo "Probing candidate JS URLs to verify they are live..."
+          cat candidate_js_urls.txt | httpx -silent -mc 200 -threads 50 > js_urls.txt
+          
           COUNT=$(wc -l < js_urls.txt)
-          echo "✅ Found $COUNT live and valid JS URLs using headless discovery."
+          echo "✅ Found $COUNT live and valid JS URLs using Headless discovery."
           echo "count=$COUNT" >> $GITHUB_OUTPUT
 
       - name: Upload discovered-js-urls artifact
@@ -114,6 +104,8 @@ jobs:
         with:
           name: discovered-js-urls
           path: js_urls.txt
+          if-no-files-found: 'warn'
+
 
   generate_matrix:
     name: "Generate chunks"

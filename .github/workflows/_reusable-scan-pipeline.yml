@@ -65,7 +65,8 @@ jobs:
           wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo apt install -y ./google-chrome-stable_current_amd64.deb
           npm install -g js-beautify
-
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+        
       - name: Crawl with Headless Katana and Probe JS URLs
         id: count
         env:

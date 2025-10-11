@@ -305,22 +305,22 @@ jobs:
             echo "No new manifest entries found."
           fi
 
-          README="$TARGET_BASE/README_MANIFEST.md"
-          echo '# README - JS Manifest Lookup' > "$README"
-          echo '------------------------------------' >> "$README"
-          echo 'This manifest maps content-hash filenames to original URLs in CSV format:' >> "$README"
-          echo '`<hash>.js,<original_url>`' >> "$README"
-          echo '' >> "$README"
-          echo 'To find the original URL for a given changed JS file (example: `9f2a....js`):' >> "$README"
-          echo "
-```bash" >> "$README"
-echo "grep '^9f2a' manifest.csv" >> "$README"
-echo "```" >> "$README"
-          echo 'To show only the URL column for a specific hash:' >> "$README"
-          echo "
-```bash" >> "$README"
-echo "grep '^9f2a' manifest.csv | cut -d',' -f2-" >> "$README"
-echo "```" >> "$README"
+      - name: Create README using Here Document
+        run: |
+          TARGET_BASE="js_files/${{ steps.set-domain.outputs.target_domain }}"
+          README_FILE="$TARGET_BASE/README_MANIFEST.md"
+          
+          # This is the safe way to write multi-line content with special characters
+          cat <<'EOF' > "$README_FILE"
+          # README - JS Manifest Lookup
+          ------------------------------------
+          This manifest maps content-hash filenames to original URLs in CSV format:
+          `<hash>.js,<original_url>`
+          
+          To find the original URL for a given changed JS file (example: `9f2a....js`):
+          ```bash
+          grep '^9f2a' manifest.csv
+          
 
       - name: Commit changes
         id: git_commit

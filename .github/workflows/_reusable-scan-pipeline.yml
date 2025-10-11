@@ -286,24 +286,44 @@ jobs:
 
       - name: Consolidate files, manifests, and add README
         run: |
+          # --- START: Variables ---
           TARGET_BASE="js_files/${{ steps.set-domain.outputs.target_domain }}"
           TARGET_FILES="$TARGET_BASE/files"
           TARGET_MANIFEST="$TARGET_BASE/manifest.csv"
-          mkdir -p "$TARGET_FILES"
           TMP_MAN="all_artifacts/merged_manifest.tmp"
-
-          find all_artifacts/ -type f -name "*.js" -exec cp -n {} "$TARGET_FILES/" \;
-          find all_artifacts/ -type f -name "manifest.csv" -exec cat {} + >> "$TMP_MAN" || true
-
-          if [ -f "$TMP_MAN" ]; then
-            touch "$TARGET_MANIFEST"
-            cat "$TMP_MAN" "$TARGET_MANIFEST" | sort -u -t, -k2,2 > "${TARGET_MANIFEST}.final"
-            mv "${TARGET_MANIFEST}.final" "$TARGET_MANIFEST"
-            rm -f "$TMP_MAN"
-            echo "Manifest consolidated: $(wc -l < $TARGET_MANIFEST) entries."
+          # --- END: Variables ---
+          
+          mkdir -p "$TARGET_FILES"
+          
+          # --- CORE FIX: Check if the artifacts directory exists AND is not empty ---
+          if [ -d "all_artifacts" ] && [ "$(ls -A all_artifacts)" ]; then
+            echo "Artifacts found. Starting consolidation..."
+          
+            # Move JS files, do not overwrite existing ones
+            find all_artifacts/ -type f -name "*.js" -exec cp -n {} "$TARGET_FILES/" \;
+          
+            # Consolidate all manifest.csv files from all chunks
+            find all_artifacts/ -type f -name "manifest.csv" -exec cat {} + > "$TMP_MAN" || true
+          
+            # If the temporary manifest has content, merge it
+            if [ -f "$TMP_MAN" ] && [ -s "$TMP_MAN" ]; then
+              touch "$TARGET_MANIFEST" # Ensure the main manifest exists
+              
+              # Merge, sort by URL (field 2), and remove duplicates
+              cat "$TMP_MAN" "$TARGET_MANIFEST" | sort -u -t, -k2,2 > "${TARGET_MANIFEST}.final"
+              mv "${TARGET_MANIFEST}.final" "$TARGET_MANIFEST"
+              
+              rm -f "$TMP_MAN"
+              echo "✅ Manifest consolidated: $(wc -l < "$TARGET_MANIFEST") total entries."
+            else
+              echo "No new manifest entries found in artifacts."
+            fi
+          
           else
-            echo "No new manifest entries found."
+            echo "⚠️ Warning: 'all_artifacts' directory not found or is empty. No new files to process."
           fi
+    
+
 
       - name: Create README using Here Document
         run: |

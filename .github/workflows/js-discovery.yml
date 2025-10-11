@@ -27,8 +27,8 @@ jobs:
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
       - name: Discover and Filter Subdomains
         run: |
-          # Using repository variable for the target domain
-          subfinder -d "${{ vars.TARGET_DOMAIN }}" -silent | httpx -silent -status-code -mc 200,301,302,307 -o live_subdomains.txt
+          # FIX: Removed the '-status-code' flag from httpx to output clean URLs.
+          subfinder -d "${{ vars.TARGET_DOMAIN }}" -silent | httpx -silent -mc 200,301,302,307 -o live_subdomains.txt
       - name: Check if live hosts were found
         id: check_file
         run: |
@@ -45,6 +45,7 @@ jobs:
         with:
           name: live-subdomains-${{ github.run_id }}
           path: live_subdomains.txt
+
 
   generate-matrix:
     name: "2. Generate Parallel Matrix"

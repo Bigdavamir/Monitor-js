@@ -314,23 +314,21 @@ jobs:
 
           # Write a README that shows how to lookup URL by hash
           README="$TARGET_BASE/README_MANIFEST.md"
-          cat > "$README" <<'EOF'
-README - JS manifest lookup
-----------------------------------
-This manifest maps content-hash filenames to original URLs in CSV format:
-  <hash>.js,<original_url>
-
-To find the original URL for a given changed JS file (example: 9f2a... .js):
-  grep '^9f2a' manifest.csv
-
-To find by full filename:
-  grep '9f2a...' manifest.csv
-
-To show only the URL column for a specific hash:
-  grep '^9f2a' manifest.csv | cut -d',' -f2-
-
-Keep this file under version control with the manifest so you can trace which URL produced a particular content hash.
-EOF
+          {
+            echo 'README - JS manifest lookup'
+            echo '------------------------------------'
+            echo 'This manifest maps content-hash filenames to original URLs in CSV format:'
+            echo '<hash>.js,<original_url>'
+            echo ''
+            echo 'To find the original URL for a given changed JS file (example: 9f2a....js):'
+            echo "grep '^9f2a' manifest.csv"
+            echo ''
+            echo 'To find by full filename:'
+            echo "grep '9f2a...' manifest.csv"
+            echo ''
+            echo 'To show only the URL column for a specific hash:'
+            echo "grep '^9f2a' manifest.csv | cut -d',' -f2-"
+          } > "$README"
 
       - name: Commit changes
         id: git_commit

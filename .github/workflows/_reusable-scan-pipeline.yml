@@ -330,38 +330,47 @@ jobs:
           TARGET_BASE="js_files/${{ steps.set-domain.outputs.target_domain }}"
           README_FILE="$TARGET_BASE/README_MANIFEST.md"
           
-          # This is the safe way to write multi-line content with special characters
-          cat <<'EOF' > "$README_FILE"
+          # Using <<-EOF allows the closing EOF to be indented
+          cat <<-EOF > "$README_FILE"
           # README - JS Manifest Lookup
           ------------------------------------
-          This manifest maps content-hash filenames to original URLs in CSV format:
-          `<hash>.js,<original_url>`
-          
-          To find the original URL for a given changed JS file (example: `9f2a....js`):
-          ```bash
-          grep '^9f2a' manifest.csv
-          
+          This manifest maps content-hash filenames to their original URLs.
 
-      - name: Commit changes
+          The format is: \`<hash>.js,<original_url>\`
+
+          To find the original URL for a specific file:
+
+              # Example: Find URL for a file starting with '9f2a'
+              grep '^9f2a' manifest.csv
+          EOF
+
+      - name: Detect and Commit Changes
         id: git_commit
         run: |
           TARGET_BASE="js_files/${{ steps.set-domain.outputs.target_domain }}"
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action-bot@github.com"
           git add -A "$TARGET_BASE/"
+          
           if git diff --staged --quiet; then
-            echo "No changes detected."
+            echo "✅ No changes detected in monitored JS files."
             echo "changes_detected=false" >> $GITHUB_OUTPUT
             exit 0
           fi
+          
+          echo "📦 Changes detected. Committing updates..."
           git commit -m "[JS Scan] Update files for ${{ steps.set-domain.outputs.target_domain }}"
           git pull origin main --rebase
           git push origin main
+          
           echo "changes_detected=true" >> $GITHUB_OUTPUT
+          
+          # Capture changed files for the next step
           CHANGED_FILES=$(git diff --name-only HEAD^ HEAD -- "$TARGET_BASE/")
           echo "changed_files<<EOF" >> $GITHUB_OUTPUT
           echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
+
 
       - name: Analyze & notify
         if: steps.git_commit.outputs.changes_detected == 'true'

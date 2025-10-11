@@ -15,7 +15,7 @@ permissions:
   contents: write
 jobs:
   discover-and-filter:
-    name: "1. Discover & Filter URLs (Hybrid Strategy v3)"
+    name: "1. Discover & Filter URLs (Hybrid Strategy v4)"
     runs-on: ubuntu-latest
     outputs:
       live_urls_found: ${{ steps.check_file.outputs.found }}
@@ -33,36 +33,37 @@ jobs:
           go install -v github.com/lc/gau/v2/cmd/gau@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
           
-      - name: "Robust Discovery Pipeline"
+      - name: "Robust Discovery Pipeline with Parameter Stripping"
         run: |
           # === STAGE 1: Get high-quality, live subdomain seeds ===
-          echo "INFO: Stage 1/4 - Discovering live subdomains for ${{ vars.TARGET_DOMAIN }}..."
+          echo "INFO: Stage 1/5 - Discovering live subdomains for ${{ vars.TARGET_DOMAIN }}..."
           subfinder -d "${{ vars.TARGET_DOMAIN }}" -silent | httpx -silent -mc 200,301,302,307 > live_subdomains.txt
           echo "INFO: Found $(wc -l < live_subdomains.txt) live subdomains."
 
-          # === STAGE 2: Run gau in VERBOSE mode, feeding it live subdomains ===
-          # The --verbose flag is CRITICAL to prevent the 'no output' timeout.
-          # Processing subdomains one by one is more stable than one giant root domain query.
-          echo "INFO: Stage 2/4 - Fetching historical URLs for each subdomain (verbose mode)..."
+          # === STAGE 2: Run gau in VERBOSE mode ===
+          echo "INFO: Stage 2/5 - Fetching historical URLs for each subdomain (verbose mode)..."
           cat live_subdomains.txt | gau --threads 20 --verbose > gau_urls.txt
           echo "INFO: Found $(wc -l < gau_urls.txt) historical URLs from gau."
 
           # === STAGE 3: Combine and apply aggressive pre-filter ===
-          echo "INFO: Stage 3/4 - Combining lists and applying aggressive extension/path filter..."
+          echo "INFO: Stage 3/5 - Combining lists and applying aggressive extension/path filter..."
           cat live_subdomains.txt gau_urls.txt | sort -u > combined_urls.txt
           
-          # This filter removes a huge list of non-webpage extensions BEFORE the slow probe.
           EXT_FILTER="\.(jpg|jpeg|png|gif|bmp|svg|webp|ico|css|woff|woff2|ttf|eot|otf|pdf|zip|gz|tar|rar|bz2|7z|exe|msi|bin|dmg|pkg|deb|rpm|doc|docx|xls|xlsx|ppt|pptx|mp3|mp4|mov|avi|mkv|webm|iso|csv|xml|json)$"
           grep -Eiv "$EXT_FILTER" combined_urls.txt | \
-          grep -Eiv "/(vendor|assets|lib|libs|third-party|node_modules|static)/" > potential_targets.txt
+          grep -Eiv "/(vendor|assets|lib|libs|third-party|node_modules|static)/" > potential_targets_with_params.txt
           
-          echo "INFO: Reduced from $(wc -l < combined_urls.txt) to $(wc -l < potential_targets.txt) potential target URLs after filtering."
+          echo "INFO: Reduced to $(wc -l < potential_targets_with_params.txt) URLs after initial filtering."
 
-          # === STAGE 4: Final validation probe with an optimized httpx ===
-          # -t 100: High concurrency
-          # -timeout 10: Don't get stuck on a single slow URL for more than 10 seconds.
-          echo "INFO: Stage 4/4 - Starting final validation probe with httpx (10s timeout per URL)..."
-          cat potential_targets.txt | httpx -silent -mc 200,301,302,307 -t 100 -timeout 10 -o live_urls.txt
+          # === STAGE 4: Strip URL parameters and deduplicate ===
+          # This is the optimization you suggested. It dramatically reduces the workload.
+          echo "INFO: Stage 4/5 - Stripping parameters and deduplicating URLs..."
+          sed 's/\?.*//' potential_targets_with_params.txt | sort -u > unique_potential_targets.txt
+          echo "INFO: Reduced to $(wc -l < unique_potential_targets.txt) unique URLs after parameter stripping."
+
+          # === STAGE 5: Final validation probe with an optimized httpx ===
+          echo "INFO: Stage 5/5 - Starting final validation probe with httpx (10s timeout per URL)..."
+          cat unique_potential_targets.txt | httpx -silent -mc 200,301,302,307 -t 100 -timeout 10 -o live_urls.txt
           echo "INFO: Final validation complete."
 
       - name: Check if live URLs were found
@@ -81,6 +82,7 @@ jobs:
         with:
           name: live-urls-${{ github.run_id }}
           path: live_urls.txt
+
 
 
 

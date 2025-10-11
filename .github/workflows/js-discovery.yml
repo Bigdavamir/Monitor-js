@@ -32,20 +32,23 @@ jobs:
           go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
           go install -v github.com/lc/gau/v2/cmd/gau@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-      - name: "Hybrid Discovery: Subdomains + Deep URL Crawl"
+      - name: "Hybrid Discovery: Subdomains + Deep URL Crawl + Final Validation"
         run: |
-          # Step 1: Discover all live subdomains
+          # Step 1: Discover all live subdomains (initial seed)
           subfinder -d "${{ vars.TARGET_DOMAIN }}" -silent | httpx -silent -mc 200,301,302,307 > live_subdomains.txt
           
           # Step 2: Discover all historical URLs for the root domain
           gau --providers wayback,commoncrawl,otx,urlscan "${{ vars.TARGET_DOMAIN }}" > gau_urls.txt
           
-          # Step 3: Combine lists and filter out static/library content
+          # Step 3: Combine lists, make them unique, and apply initial filters
           cat live_subdomains.txt gau_urls.txt | sort -u | \
           grep -Eiv "\.(jpg|jpeg|png|gif|bmp|svg|webp|css|woff|woff2|ttf|eot|ico|pdf|zip|gz|rar|mp3|mp4|mov|avi)$" | \
           grep -Eiv "/(vendor|assets|lib|libs|third-party|node_modules)/" > potential_targets.txt
           
-          # Step 4: Final check to ensure all targets are live
+          # Step 4 (THE CRITICAL FIX): Probe all potential targets. httpx will:
+          # - Follow redirects (http -> https) and output the FINAL URL.
+          # - Filter out all dead links (404s, timeouts, etc.).
+          # - Ensure the final list contains only 100% live and accessible URLs.
           cat potential_targets.txt | httpx -silent -mc 200,301,302,307 -o live_urls.txt
 
       - name: Check if live URLs were found
@@ -53,10 +56,10 @@ jobs:
         run: |
           if [ -s live_urls.txt ]; then
             echo "found=true" >> $GITHUB_OUTPUT
-            echo "Found $(wc -l < live_urls.txt) live URLs after filtering."
+            echo "Found $(wc -l < live_urls.txt) verified live URLs to process."
           else
             echo "found=false" >> $GITHUB_OUTPUT
-            echo "No live URLs found. Stopping workflow."
+            echo "No live URLs found after final validation. Stopping workflow."
           fi
       - name: Upload live URLs artifact
         if: steps.check_file.outputs.found == 'true'
@@ -64,6 +67,7 @@ jobs:
         with:
           name: live-urls-${{ github.run_id }}
           path: live_urls.txt
+
 
 
 

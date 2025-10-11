@@ -40,11 +40,12 @@ jobs:
           # Step 2: Discover all historical URLs for the root domain
           gau --providers wayback,commoncrawl,otx,urlscan "${{ vars.TARGET_DOMAIN }}" > gau_urls.txt
           
-          # Step 3: Combine lists and filter out static content (images, css, fonts, etc.)
+          # Step 3: Combine lists and filter out static/library content
           cat live_subdomains.txt gau_urls.txt | sort -u | \
-          grep -Eiv "\.(jpg|jpeg|png|gif|bmp|svg|webp|css|woff|woff2|ttf|eot|ico|pdf|zip|gz|rar|mp3|mp4|mov|avi)$" > potential_targets.txt
+          grep -Eiv "\.(jpg|jpeg|png|gif|bmp|svg|webp|css|woff|woff2|ttf|eot|ico|pdf|zip|gz|rar|mp3|mp4|mov|avi)$" | \
+          grep -Eiv "/(vendor|assets|lib|libs|third-party|node_modules)/" > potential_targets.txt
           
-          # Step 4: Final check to ensure all targets are live before passing to the next job
+          # Step 4: Final check to ensure all targets are live
           cat potential_targets.txt | httpx -silent -mc 200,301,302,307 -o live_urls.txt
 
       - name: Check if live URLs were found

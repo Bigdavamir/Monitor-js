@@ -57,15 +57,41 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-node-pip-chrome-
 
-      - name: Install Tools & Google Chrome
+      - name: Install Tools, Dependencies, & Google Chrome
         run: |
-          sudo apt-get update && sudo apt-get install -y libpcre3-dev
+          # --- FIX: Install all known dependencies for headless Chrome ---
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgbm-dev \
+            libnss3 \
+            libasound2 \
+            libatk-bridge2.0-0 \
+            libcups2 \
+            libdbus-1-3 \
+            libgdk-pixbuf2.0-0 \
+            libgtk-3-0 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxrandr2 \
+            libxss1 \
+            libxtst6 \
+            lsb-release \
+            wget \
+            xdg-utils \
+            libpcre3-dev
+
+          # Install Go tools
           go install -v github.com/projectdiscovery/katana/cmd/katana@latest
           go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+          # Install Chrome
           wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo apt install -y ./google-chrome-stable_current_amd64.deb
+
+          # Install Node tools
           npm install -g js-beautify
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
         
       - name: Crawl with Headless Katana and Probe JS URLs
         id: count

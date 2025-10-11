@@ -104,15 +104,16 @@ jobs:
         env:
           SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
         run: |
-          # --- DEBUG: Print every command before execution ---
+          # DEBUG: Print every command before execution
           set -x
 
           TARGET_DOMAIN="${{ steps.set-domain.outputs.target_domain }}"
           echo "🚀 Starting Headless discovery for: $TARGET_DOMAIN"
           
-          # --- DEBUG: Verify tool versions and paths ---
+          # Verify tool versions and paths
           katana -version
 
+          # --- FIX: Added '--no-sandbox' for Chrome running in CI/CD environment ---
           # Define Katana arguments
           KATANA_ARGS=(
             "-u" "$TARGET_DOMAIN"
@@ -124,6 +125,7 @@ jobs:
             "-sc"               # Use installed chrome
             "-timeout" "180"
             "-hht" "120"
+            "-headless-options" "no-sandbox,disable-dev-shm-usage" # Pass required flags to Chrome
           )
           
           # Conditionally add session cookie
@@ -131,8 +133,8 @@ jobs:
             KATANA_ARGS+=("-hH" "Cookie: $SESSION_COOKIE")
           fi
           
-          # Execute Katana
-          katana "${KATANA_ARGS[@]}" > candidate_js_urls.txt
+          # Execute Katana - a non-zero exit code will not fail the step
+          katana "${KATANA_ARGS[@]}" > candidate_js_urls.txt || true
 
           echo "Probing candidate JS URLs to verify they are live..."
           cat candidate_js_urls.txt | httpx -silent -mc 200 -threads 50 > js_urls.txt
@@ -140,6 +142,7 @@ jobs:
           COUNT=$(wc -l < js_urls.txt)
           echo "✅ Found $COUNT live and valid JS URLs using Headless discovery."
           echo "count=$COUNT" >> $GITHUB_OUTPUT
+
 
 
 

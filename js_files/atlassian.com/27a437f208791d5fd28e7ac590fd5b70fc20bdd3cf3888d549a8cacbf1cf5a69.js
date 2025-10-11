@@ -1,0 +1,1 @@
+ { "type": "WacAppSwitcher", "domRootId": "adg4-app-switcher", "props": { "domRootId": "adg4-app-switcher", "wacAppSwitcherLabel": "", "allowWacJoinSitesProvider": true } } 

@@ -1,0 +1,1 @@
+ { "type": "ReturnToProductModal", "domRootId": "return-to-product-modal", "props": { "messages": { "returnToProductModalHeroText": "Welcome back, {name}", "returnToProductModalSubText": "Pick up where you left off.", "returnToProductModalCtaText": "Go" } } } 

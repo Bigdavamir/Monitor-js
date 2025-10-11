@@ -1,0 +1,1 @@
+window.SSR_detailMetrics=Object.freeze({"getFeatureGateValues":{"startTime":0,"duration":30},"fetchUserLocaleS2S":{"startTime":30,"duration":20},"initializeFeatureGatesClient":{"startTime":50,"duration":5},"render":{"startTime":56,"duration":158}});window.SSR_totalMetrics=Object.freeze({"startTime":1760198727242,"duration":214});window.SSR_region="us-west-2";

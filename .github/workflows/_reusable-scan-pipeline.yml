@@ -75,22 +75,25 @@ jobs:
           TARGET_DOMAIN="${{ steps.set-domain.outputs.target_domain }}"
           echo "🚀 Starting Headless discovery for: $TARGET_DOMAIN"
           
-          # FIX 1: Add generous timeouts for complex sites and adjust concurrency
+          # Define Katana arguments as a Bash array for clean handling of parameters
           KATANA_ARGS=(
             "-u" "$TARGET_DOMAIN"
             "-silent"
             "-jc"               # Extract JS files only
             "-d" "3"            # Max depth
-            "-c" "8"            # Concurrency (slightly reduced)
+            "-c" "8"            # Concurrency
             "-headless"
             "-sc"               # Use installed chrome
             "-timeout" "180"    # Main timeout for the entire crawl (3 minutes)
             "-hht" "120"        # Headless-specific operations timeout (2 minutes)
           )
+          
+          # Conditionally add the session cookie header if it exists
           if [ -n "$SESSION_COOKIE" ]; then
             KATANA_ARGS+=("-hH" "Cookie: $SESSION_COOKIE")
           fi
           
+          # --- FIX: Corrected the array expansion syntax ---
           katana "${KATANA_ARGS[@]}" > candidate_js_urls.txt
 
           echo "Probing candidate JS URLs to verify they are live..."
@@ -99,6 +102,7 @@ jobs:
           COUNT=$(wc -l < js_urls.txt)
           echo "✅ Found $COUNT live and valid JS URLs using Headless discovery."
           echo "count=$COUNT" >> $GITHUB_OUTPUT
+
 
       - name: Upload discovered-js-urls artifact
         uses: actions/upload-artifact@v4

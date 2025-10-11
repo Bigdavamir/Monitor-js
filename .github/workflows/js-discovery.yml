@@ -160,7 +160,7 @@ jobs:
           pattern: captured-js-*-${{ github.run_id }}
           if-no-files-found: warn
 
-      - name: Consolidate, Deduplicate, and Prepare Commit
+      - name: Consolidate, Deduplicate, Filter, and Prepare Commit
         id: process_files
         run: |
           TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
@@ -177,24 +177,36 @@ jobs:
             exit 0
           fi
 
+          # NEW: Define common library signatures. This list can be expanded.
+          PATTERNS="/*! jQuery|jQuery Foundation|React v|@license|Licensed under MIT|Bootstrap v|Angular v|webpackBootstrap|Moment.js|lodash|core-js|modernizr"
+
           find all_js_artifacts -type f -name "*.js" | while read -r js_file; do
             HASH=$(basename "$js_file" .js)
             
+            # Check if this hash is already known
             if ! grep -q "^$HASH," "$MASTER_INDEX_FILE"; then
-              INDEX_FILE=$(dirname "$js_file")/index.txt
-              URL=$(grep "^$HASH," "$INDEX_FILE" | cut -d, -f2-)
               
-              if [[ -n "$URL" ]]; then
-                echo "New file found: Hash $HASH from URL $URL"
-                cp "$js_file" "$TARGET_DIR/$HASH.js"
-                echo "$HASH,$URL,$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$MASTER_INDEX_FILE"
-                echo "✅ New JS: $URL" >> $NEW_FILES_SUMMARY
+              # --- NEW: Content-based library filtering ---
+              # Before processing, check the first 20 lines for library signatures.
+              if head -n 20 "$js_file" | grep -qiE "$PATTERNS"; then
+                echo "  -> Ignoring new library file: Hash $HASH"
+              else
+                # This is a new, non-library file. Process it.
+                INDEX_FILE=$(dirname "$js_file")/index.txt # Corrected from index.csv to index.txt
+                URL=$(grep "^$HASH," "$INDEX_FILE" | cut -d, -f2-)
+                
+                if [[ -n "$URL" ]]; then
+                  echo "New custom file found: Hash $HASH from URL $URL"
+                  cp "$js_file" "$TARGET_DIR/$HASH.js"
+                  echo "$HASH,$URL,$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$MASTER_INDEX_FILE"
+                  echo "✅ New Custom JS: $URL" >> $NEW_FILES_SUMMARY
+                fi
               fi
             fi
           done
           
           if [ ! -s "$NEW_FILES_SUMMARY" ]; then
-            echo "No new JS files detected."
+            echo "No new custom JS files detected."
             echo "changes_detected=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -203,6 +215,7 @@ jobs:
           echo "summary<<EOF" >> $GITHUB_OUTPUT
           cat $NEW_FILES_SUMMARY >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
+
 
       - name: Commit Changes
         if: steps.process_files.outputs.changes_detected == 'true'

@@ -1,5 +1,5 @@
 # _reusable-scan-pipeline.yml
-name: Reusable JS Scan Pipeline (Subfinder + Gau + Katana + SHA256 dedupe)
+name: Reusable JS Scan Pipeline (Headless Katana + SHA256 dedupe)
 
 on:
   workflow_call:
@@ -22,7 +22,7 @@ env:
 
 jobs:
   discover_urls:
-    name: "Discover JS Candidates (${{ inputs.environment_name }})"
+    name: "Discover JS URLs with Headless Katana (${{ inputs.environment_name }})"
     runs-on: ubuntu-latest
     outputs:
       js_count: ${{ steps.count.outputs.count }}
@@ -47,7 +47,7 @@ jobs:
         with:
           node-version: '18'
 
-      - name: Cache Go/Node/Pip
+      - name: Cache Go/Node/Pip & Chrome
         uses: actions/cache@v4
         with:
           path: |
@@ -56,43 +56,57 @@ jobs:
             ${{ env.GOPATH }}/bin
             ~/.npm
             ~/.cache/pip
-          key: ${{ runner.os }}-tool-cache-v1
+            /opt/google/chrome
+          key: ${{ runner.os }}-tool-cache-v2 # Incremented key for new cache contents
 
-      - name: Install discovery tools
+      - name: Install Tools & Google Chrome
         run: |
-          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          go install -v github.com/lc/gau/v2/cmd/gau@latest
+          # Install Chrome for headless crawling if not cached
+          if ! command -v google-chrome-stable &> /dev/null
+          then
+            echo "Google Chrome not found, installing..."
+            wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O chrome.deb
+            sudo dpkg -i chrome.deb
+            sudo apt-get install -f -y # Install dependencies
+            rm chrome.deb
+          else
+            echo "Google Chrome is already installed (from cache)."
+          fi
+          
+          # Install Go-based tools
           go install -v github.com/projectdiscovery/katana/cmd/katana@latest
           go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
-      - name: Discover Subdomains and Fetch JS URLs
+      - name: Crawl with Headless Katana and Probe JS URLs
         id: count
+        env:
+          SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
         run: |
           TARGET_DOMAIN="${{ steps.set-domain.outputs.target_domain }}"
-          echo "🚀 Starting discovery for: $TARGET_DOMAIN"
+          echo "🚀 Starting headless discovery for: $TARGET_DOMAIN"
           
-          # Step 1: Find live subdomains
-          echo "Finding live subdomains..."
-          subfinder -d "$TARGET_DOMAIN" -silent | httpx -silent -status-code -mc 200,301,302,307 -o live_subdomains.txt
-          echo "Found $(wc -l < live_subdomains.txt) live subdomains."
-
-          # Step 2: Gather JS URLs from historical sources (gau) and active crawling (katana) in parallel
-          echo "Gathering JS URLs from gau (historical) and katana (active)..."
-          cat live_subdomains.txt | gau --threads 10 --providers wayback,commoncrawl,otx,urlscan | grep -iE '\.js($|\?)' > gau_js.txt &
-          katana -list live_subdomains.txt -silent -jc -d 3 -c 25 -H "User-Agent: Mozilla/5.0" | grep -iE '\.js($|\?)' > katana_js.txt &
-          wait # Wait for both background jobs to finish
-
-          # Step 3: Combine, deduplicate, and perform the final, efficient probe on candidates
-          echo "Combining, sorting, and probing candidate JS URLs..."
-          cat gau_js.txt katana_js.txt | sort -u > candidate_js_urls.txt
+          # Step 1: Crawl the root domain and its subdomains with headless Katana
+          # -cs: Crawl subdomains
+          # -headless: Run a full browser to render JS and find dynamic URLs
+          # -sc: Use the system-installed Chrome
+          # -jc: Only output Javascript file URLs
+          echo "Crawling with Headless Katana to find all static and dynamic JS files..."
+          KATANA_ARGS=("-u" "$TARGET_DOMAIN" "-cs" "-silent" "-jc" "-d" "3" "-c" "10" "-headless" "-sc")
+          if [ -n "$SESSION_COOKIE" ]; then
+            KATANA_ARGS+=("-hH" "Cookie: $SESSION_COOKIE")
+          fi
           
-          # This is the key part: only probe the .js files now to ensure they are live (200 OK)
+          # We no longer need grep because -jc already filters for JS URLs
+          katana "${KATANA_ARGS[@]}" > candidate_js_urls.txt
+          
+          # Step 2: Probe candidate URLs to ensure they are live (200 OK)
+          echo "Probing candidate JS URLs to verify they are live..."
           cat candidate_js_urls.txt | httpx -silent -mc 200 -threads ${{ env.JS_PROBE_THREADS }} > js_urls.txt
 
-          # Step 4: Final count and output
+          # Step 3: Final count and output
           COUNT=$(wc -l < js_urls.txt)
-          echo "✅ Found $COUNT live and valid JS URLs."
+          echo "✅ Found $COUNT live and valid JS URLs using headless discovery."
           echo "count=$COUNT" >> $GITHUB_OUTPUT
 
       - name: Upload discovered-js-urls artifact
@@ -154,7 +168,7 @@ jobs:
             ${{ env.GOPATH }}/bin
             ~/.npm
             ~/.cache/pip
-          key: ${{ runner.os }}-tool-cache-v1
+          key: ${{ runner.os }}-tool-cache-v2
 
       - name: Setup Go & Node
         uses: actions/setup-go@v5
@@ -236,7 +250,6 @@ jobs:
           }
           export -f process_url WGET_ARGS LIBS_IGNORE LIBS_HASHES
           
-          # Limit the number of downloads to prevent timeouts on huge targets
           head -n ${{ env.MAX_DOWNLOADS_PER_CHUNK }} "$ALL_URLS" > "$RUNNER_DIR/to_process.txt"
           cat "$RUNNER_DIR/to_process.txt" | xargs -P ${{ env.DOWNLOAD_CONCURRENCY }} --no-run-if-empty -I {} bash -c 'process_url "$@"' _ {}
 
@@ -249,7 +262,7 @@ jobs:
   consolidate_and_commit:
     name: "Consolidate & Commit (${{ inputs.environment_name }})"
     needs: process_chunk
-    if: always() # Run even if process_chunk fails or is skipped
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Checkout full repo

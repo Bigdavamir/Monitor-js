@@ -1,5 +1,5 @@
 # _reusable-scan-pipeline.yml
-name: Reusable JS Scan Pipeline (Katana + httpx probe + SHA256 dedupe)
+name: Reusable JS Scan Pipeline (Subfinder + Gau + Katana + SHA256 dedupe)
 
 on:
   workflow_call:
@@ -60,49 +60,39 @@ jobs:
 
       - name: Install discovery tools
         run: |
-          go install github.com/projectdiscovery/katana/cmd/katana@latest
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install -v github.com/lc/gau/v2/cmd/gau@latest
+          go install -v github.com/projectdiscovery/katana/cmd/katana@latest
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
-      - name: Run katana crawl (produce candidates)
+      - name: Discover Subdomains and Fetch JS URLs
+        id: count
         run: |
-          TARGET="${{ steps.set-domain.outputs.target_domain }}"
-          echo "$TARGET" > target.txt
-          katana -list target.txt -jc -silent -d 3 -c 20 -H "User-Agent: Mozilla/5.0" -o katana-out.txt || true
-          # Keep only same-domain candidates
-          grep -iE "^https?://(www\.)?${{ steps.set-domain.outputs.target_domain }}/" katana-out.txt | sort -u > all_candidates.txt || true
-          echo "katana produced $(wc -l < all_candidates.txt || true) candidates."
+          TARGET_DOMAIN="${{ steps.set-domain.outputs.target_domain }}"
+          echo "🚀 Starting discovery for: $TARGET_DOMAIN"
+          
+          # Step 1: Find live subdomains
+          echo "Finding live subdomains..."
+          subfinder -d "$TARGET_DOMAIN" -silent | httpx -silent -status-code -mc 200,301,302,307 -o live_subdomains.txt
+          echo "Found $(wc -l < live_subdomains.txt) live subdomains."
 
-      - name: Probe candidates with httpx and extract JS URLs
-        run: |
-          if [ ! -s all_candidates.txt ]; then
-            echo "count=0" >> $GITHUB_OUTPUT
-            touch js_urls.txt
-            exit 0
-          fi
+          # Step 2: Gather JS URLs from historical sources (gau) and active crawling (katana) in parallel
+          echo "Gathering JS URLs from gau (historical) and katana (active)..."
+          cat live_subdomains.txt | gau --threads 10 --providers wayback,commoncrawl,otx,urlscan | grep -iE '\.js($|\?)' > gau_js.txt &
+          katana -list live_subdomains.txt -silent -jc -d 3 -c 25 -H "User-Agent: Mozilla/5.0" | grep -iE '\.js($|\?)' > katana_js.txt &
+          wait # Wait for both background jobs to finish
 
-          cat all_candidates.txt | httpx -silent -threads ${{ env.JS_PROBE_THREADS }} -json -H "User-Agent: Mozilla/5.0" -o probed.json || true
+          # Step 3: Combine, deduplicate, and perform the final, efficient probe on candidates
+          echo "Combining, sorting, and probing candidate JS URLs..."
+          cat gau_js.txt katana_js.txt | sort -u > candidate_js_urls.txt
+          
+          # This is the key part: only probe the .js files now to ensure they are live (200 OK)
+          cat candidate_js_urls.txt | httpx -silent -mc 200 -threads ${{ env.JS_PROBE_THREADS }} > js_urls.txt
 
-          # Filter rules:
-          # 1) content_type contains javascript
-          # 2) OR content_length header exists and > 0
-          # 3) OR URL ends with .js (fallback)
-          jq -r '
-            (.[] |
-              select(
-                ((.content_type // "") | test("javascript|x-javascript")) 
-                or ((.content_length // "0") | tonumber > 0)
-                or (.url | test("\\.js($|\\?)"; "i"))
-              ).url
-            )
-          ' probed.json 2>/dev/null > probed_js_urls.txt || true
-
-          # also include any candidate that explicitly ends with .js in case probe missed it
-          grep -iE "\\.js($|\\?)" all_candidates.txt >> probed_js_urls.txt || true
-
-          sort -u -o js_urls.txt probed_js_urls.txt || true
-          COUNT=$(wc -l < js_urls.txt || echo 0)
-          echo "Found $COUNT JS candidate URLs after httpx probe."
+          # Step 4: Final count and output
+          COUNT=$(wc -l < js_urls.txt)
+          echo "✅ Found $COUNT live and valid JS URLs."
           echo "count=$COUNT" >> $GITHUB_OUTPUT
 
       - name: Upload discovered-js-urls artifact
@@ -114,7 +104,7 @@ jobs:
   generate_matrix:
     name: "Generate chunks"
     needs: discover_urls
-    if: needs.discover_urls.outputs.js_count != '0'
+    if: needs.discover_urls.outputs.js_count > 0
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.split.outputs.matrix }}
@@ -130,11 +120,7 @@ jobs:
         run: |
           PARALLEL=${{ env.PARALLEL_WORKERS }}
           mkdir -p chunks
-          total_lines=$(wc -l < js_urls.txt || echo 0)
-          if [ "$total_lines" -eq 0 ]; then
-            echo "matrix=[]" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+          total_lines=$(wc -l < js_urls.txt)
           lines_per_chunk=$(( (total_lines + PARALLEL - 1) / PARALLEL ))
           split -d -l $lines_per_chunk js_urls.txt chunks/chunk_
           CHUNKS_JSON=$(ls -1 chunks/ | jq -R -s -c 'split("\n") | map(select(length > 0))')
@@ -159,13 +145,6 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Normalize target
-        id: set-domain
-        run: |
-          DOMAIN="${{ inputs.environment_name }}"
-          TARGET_DOMAIN=$(echo "$DOMAIN" | sed 's/-com$/.com/')
-          echo "target_domain=$TARGET_DOMAIN" >> $GITHUB_OUTPUT
-
       - name: Cache and setup tools
         uses: actions/cache@v4
         with:
@@ -187,9 +166,7 @@ jobs:
 
       - name: Install runtime tools
         run: |
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           npm install -g js-beautify || true
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
       - name: Download chunk
         uses: actions/download-artifact@v4
@@ -208,7 +185,7 @@ jobs:
           cp "$CHUNK" js_files_temp/runner_${{ matrix.chunk_file }}/my_chunk.txt
           echo "Runner has $(wc -l < js_files_temp/runner_${{ matrix.chunk_file }}/my_chunk.txt) URLs."
 
-      - name: Download and process (probe used earlier; download only filtered URLs)
+      - name: Download and process URLs
         env:
           SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
         run: |
@@ -223,6 +200,7 @@ jobs:
           process_url() {
             url="$1"
             [ -z "$url" ] && return
+            # Layer 1 Filter: URL pattern matching
             if [ -f "$LIBS_IGNORE" ] && grep -qf "$LIBS_IGNORE" <<< "$url"; then
               return
             fi
@@ -238,27 +216,27 @@ jobs:
                 rm -f "$tmpf"
                 return
               fi
+              # Layer 2 Filter: Content hash matching
               if [ -f "$LIBS_HASHES" ] && grep -qF "$content_hash" "$LIBS_HASHES"; then
                 rm -f "$tmpf"
                 return
               fi
               final="$RUNNER_DIR/${content_hash}.js"
+              # Only beautify and move if the file doesn't already exist
               if [ ! -f "$final" ]; then
                 js-beautify -r "$tmpf" &>/dev/null || true
                 mv "$tmpf" "$final"
               else
                 rm -f "$tmpf"
               fi
-              echo "${content_hash}.js,$url" >> "$RUNNER_DIR/manifest.csv" || true
+              echo "${content_hash}.js,$url" >> "$RUNNER_DIR/manifest.csv"
             else
               rm -f "$tmpf"
             fi
           }
-          export -f process_url
-          export WGET_ARGS
-          export LIBS_IGNORE
-          export LIBS_HASHES
-
+          export -f process_url WGET_ARGS LIBS_IGNORE LIBS_HASHES
+          
+          # Limit the number of downloads to prevent timeouts on huge targets
           head -n ${{ env.MAX_DOWNLOADS_PER_CHUNK }} "$ALL_URLS" > "$RUNNER_DIR/to_process.txt"
           cat "$RUNNER_DIR/to_process.txt" | xargs -P ${{ env.DOWNLOAD_CONCURRENCY }} --no-run-if-empty -I {} bash -c 'process_url "$@"' _ {}
 
@@ -271,6 +249,7 @@ jobs:
   consolidate_and_commit:
     name: "Consolidate & Commit (${{ inputs.environment_name }})"
     needs: process_chunk
+    if: always() # Run even if process_chunk fails or is skipped
     runs-on: ubuntu-latest
     steps:
       - name: Checkout full repo
@@ -289,6 +268,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: all_artifacts/
+          pattern: processed-js-${{ inputs.environment_name }}-*-${{ github.run_id }}
           if-no-files-found: warn
 
       - name: Consolidate files, manifests, and add README
@@ -299,36 +279,35 @@ jobs:
           mkdir -p "$TARGET_FILES"
           TMP_MAN="all_artifacts/merged_manifest.tmp"
 
-          find all_artifacts/ -type f -name "*.js" -exec cp -n {} "$TARGET_FILES/" \; || true
+          find all_artifacts/ -type f -name "*.js" -exec cp -n {} "$TARGET_FILES/" \;
           find all_artifacts/ -type f -name "manifest.csv" -exec cat {} + >> "$TMP_MAN" || true
 
           if [ -f "$TMP_MAN" ]; then
             touch "$TARGET_MANIFEST"
-            cat "$TMP_MAN" "$TARGET_MANIFEST" | sort -u -t, -k2,2 > "${TARGET_MANIFEST}.final" || true
+            cat "$TMP_MAN" "$TARGET_MANIFEST" | sort -u -t, -k2,2 > "${TARGET_MANIFEST}.final"
             mv "${TARGET_MANIFEST}.final" "$TARGET_MANIFEST"
             rm -f "$TMP_MAN"
-            echo "Manifest consolidated: $(wc -l < $TARGET_MANIFEST || true)"
+            echo "Manifest consolidated: $(wc -l < $TARGET_MANIFEST) entries."
           else
-            echo "No new manifest entries."
+            echo "No new manifest entries found."
           fi
 
-          # Write a README that shows how to lookup URL by hash
           README="$TARGET_BASE/README_MANIFEST.md"
-          {
-            echo 'README - JS manifest lookup'
-            echo '------------------------------------'
-            echo 'This manifest maps content-hash filenames to original URLs in CSV format:'
-            echo '<hash>.js,<original_url>'
-            echo ''
-            echo 'To find the original URL for a given changed JS file (example: 9f2a....js):'
-            echo "grep '^9f2a' manifest.csv"
-            echo ''
-            echo 'To find by full filename:'
-            echo "grep '9f2a...' manifest.csv"
-            echo ''
-            echo 'To show only the URL column for a specific hash:'
-            echo "grep '^9f2a' manifest.csv | cut -d',' -f2-"
-          } > "$README"
+          echo '# README - JS Manifest Lookup' > "$README"
+          echo '------------------------------------' >> "$README"
+          echo 'This manifest maps content-hash filenames to original URLs in CSV format:' >> "$README"
+          echo '`<hash>.js,<original_url>`' >> "$README"
+          echo '' >> "$README"
+          echo 'To find the original URL for a given changed JS file (example: `9f2a....js`):' >> "$README"
+          echo "
+```bash" >> "$README"
+echo "grep '^9f2a' manifest.csv" >> "$README"
+echo "```" >> "$README"
+          echo 'To show only the URL column for a specific hash:' >> "$README"
+          echo "
+```bash" >> "$README"
+echo "grep '^9f2a' manifest.csv | cut -d',' -f2-" >> "$README"
+echo "```" >> "$README"
 
       - name: Commit changes
         id: git_commit
@@ -338,14 +317,15 @@ jobs:
           git config --global user.email "action-bot@github.com"
           git add -A "$TARGET_BASE/"
           if git diff --staged --quiet; then
+            echo "No changes detected."
             echo "changes_detected=false" >> $GITHUB_OUTPUT
             exit 0
           fi
-          git commit -m "[JS Scan] Update files for ${{ steps.set-domain.outputs.target_domain }}" || true
-          git pull origin main --rebase || true
-          git push origin main || true
+          git commit -m "[JS Scan] Update files for ${{ steps.set-domain.outputs.target_domain }}"
+          git pull origin main --rebase
+          git push origin main
           echo "changes_detected=true" >> $GITHUB_OUTPUT
-          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD -- "$TARGET_BASE/" || true)
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD -- "$TARGET_BASE/")
           echo "changed_files<<EOF" >> $GITHUB_OUTPUT
           echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -358,8 +338,12 @@ jobs:
         run: |
           CHANGED_JS=$(echo "${{ steps.git_commit.outputs.changed_files }}" | grep '\.js$' || true)
           if [ -n "$CHANGED_JS" ]; then
-            chmod +x analyze_js.sh || true
-            echo "$CHANGED_JS" | ./analyze_js.sh || true
+            if [ -f "analyze_js.sh" ]; then
+              chmod +x analyze_js.sh
+              echo "$CHANGED_JS" | ./analyze_js.sh
+            fi
           fi
-          chmod +x send_notification.sh || true
-          ./send_notification.sh || true
+          if [ -f "send_notification.sh" ]; then
+            chmod +x send_notification.sh
+            ./send_notification.sh
+          fi

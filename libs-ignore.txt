@@ -1,18 +1,100 @@
-    # Analytics & Trackers
-    google-analytics.com
-    googletagmanager.com
-    analytics.js
-    gtm.js
-    
-    # Common CDNs and Libraries
-    jquery
-    jquery.min.js
-    bootstrap
-    react.js
-    react-dom.js
-    vue.js
-    moment.js
-    
-    # Ad Networks
-    doubleclick.net
-    googlesyndication.com
+# libs-ignore.txt - More precise filtering patterns
+
+# ===================================================================
+# 1. Analytics, Trackers, and Customer Engagement
+# ===================================================================
+# Match by hostname (safest)
+google-analytics.com
+googletagmanager.com
+googletagservices.com
+hotjar.com
+sentry.io
+optimizely.com
+fullstory.com
+vwo.com
+amplitude.com
+heapanalytics.com
+segment.com
+# Match specific JS files
+/gtm.js
+/analytics.js
+
+
+# ===================================================================
+# 2. Ad Networks
+# ===================================================================
+# Match by hostname
+doubleclick.net
+googlesyndication.com
+googleadservices.com
+adservice.google.com
+adnxs.com
+
+
+# ===================================================================
+# 3. Common CDNs (Content Delivery Networks)
+# ===================================================================
+# These host many popular libraries. Ignoring the host is efficient.
+ajax.googleapis.com
+cdnjs.cloudflare.com
+cdn.jsdelivr.net
+unpkg.com
+maxcdn.bootstrapcdn.com
+stackpath.bootstrapcdn.com
+code.jquery.com
+
+
+# ===================================================================
+# 4. Major JS Libraries (by filename patterns)
+# ===================================================================
+# Using more specific regex to avoid false positives.
+# The '\.' escapes the dot, and '$' anchors it to the end of the string.
+
+# jQuery
+/jquery-[0-9.]*\.js$
+/jquery-[0-9.]*\.min\.js$
+/jquery\.js$
+/jquery\.min\.js$
+
+# React
+/react\.development\.js$
+/react\.production\.min\.js$
+/react-dom\.development\.js$
+/react-dom\.production\.min\.js$
+
+# Vue.js
+/vue\.js$
+/vue\.min\.js$
+/vue\.runtime\.js$
+
+# AngularJS (Legacy)
+/angular\.js$
+/angular\.min\.js$
+
+# Bootstrap
+/bootstrap\.js$
+/bootstrap\.min\.js$
+/bootstrap\.bundle\.js$
+/bootstrap\.bundle\.min\.js$
+
+# Other popular libraries
+/lodash\.js$
+/lodash\.min\.js$
+/moment\.js$
+/moment\.min\.js$
+/moment-with-locales\.min\.js$
+/underscore\.js$
+/underscore-min\.js$
+
+
+# ===================================================================
+# 5. Other common third-party services
+# ===================================================================
+# Fonts, Polyfills, Social Widgets
+fonts.googleapis.com
+use.fontawesome.com
+use.typekit.net
+polyfill.io
+connect.facebook.net
+platform.twitter.com
+recaptcha/api.js

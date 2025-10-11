@@ -6,7 +6,13 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '0 */12 * * *'
+  push:
+    branches:
+      - 'main'
 
+# FIX: Grant write permissions to the GITHUB_TOKEN for this workflow
+permissions:
+  contents: write
 jobs:
   discover-and-filter:
     name: "1. Discover & Filter Subdomains"

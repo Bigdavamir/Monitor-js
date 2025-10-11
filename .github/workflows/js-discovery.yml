@@ -15,10 +15,10 @@ permissions:
   contents: write
 jobs:
   discover-and-filter:
-    name: "1. Discover & Filter Subdomains"
+    name: "1. Discover & Filter URLs (Hybrid Strategy)"
     runs-on: ubuntu-latest
     outputs:
-      live_hosts_found: ${{ steps.check_file.outputs.found }}
+      live_urls_found: ${{ steps.check_file.outputs.found }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -30,27 +30,40 @@ jobs:
         run: |
           go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install -v github.com/lc/gau/v2/cmd/gau@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-      - name: Discover and Filter Subdomains
+      - name: "Hybrid Discovery: Subdomains + Deep URL Crawl"
         run: |
-          # FIX: Removed the '-status-code' flag from httpx to output clean URLs.
-          subfinder -d "${{ vars.TARGET_DOMAIN }}" -silent | httpx -silent -mc 200,301,302,307 -o live_subdomains.txt
-      - name: Check if live hosts were found
+          # Step 1: Discover all live subdomains
+          subfinder -d "${{ vars.TARGET_DOMAIN }}" -silent | httpx -silent -mc 200,301,302,307 > live_subdomains.txt
+          
+          # Step 2: Discover all historical URLs for the root domain
+          gau --providers wayback,commoncrawl,otx,urlscan "${{ vars.TARGET_DOMAIN }}" > gau_urls.txt
+          
+          # Step 3: Combine lists and filter out static content (images, css, fonts, etc.)
+          cat live_subdomains.txt gau_urls.txt | sort -u | \
+          grep -Eiv "\.(jpg|jpeg|png|gif|bmp|svg|webp|css|woff|woff2|ttf|eot|ico|pdf|zip|gz|rar|mp3|mp4|mov|avi)$" > potential_targets.txt
+          
+          # Step 4: Final check to ensure all targets are live before passing to the next job
+          cat potential_targets.txt | httpx -silent -mc 200,301,302,307 -o live_urls.txt
+
+      - name: Check if live URLs were found
         id: check_file
         run: |
-          if [ -s live_subdomains.txt ]; then
+          if [ -s live_urls.txt ]; then
             echo "found=true" >> $GITHUB_OUTPUT
-            echo "Found $(wc -l < live_subdomains.txt) live subdomains."
+            echo "Found $(wc -l < live_urls.txt) live URLs after filtering."
           else
             echo "found=false" >> $GITHUB_OUTPUT
-            echo "No live subdomains found. Stopping workflow."
+            echo "No live URLs found. Stopping workflow."
           fi
-      - name: Upload live subdomains artifact
+      - name: Upload live URLs artifact
         if: steps.check_file.outputs.found == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: live-subdomains-${{ github.run_id }}
-          path: live_subdomains.txt
+          name: live-urls-${{ github.run_id }}
+          path: live_urls.txt
+
 
 
   generate-matrix:

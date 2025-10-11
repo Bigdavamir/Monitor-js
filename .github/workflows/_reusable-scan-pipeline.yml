@@ -1,10 +1,11 @@
-# Reusable JS Scan Pipeline - Optimized Single-Job Workflow (Advanced Deduplication)
-name: Reusable Scan Pipeline (Single Target)
+# _reusable-scan-pipeline.yml
+name: Reusable JS Scan Pipeline (Katana + httpx probe + SHA256 dedupe)
 
 on:
   workflow_call:
     inputs:
       environment_name:
+        description: 'The target environment name (e.g., atlassian-com)'
         required: true
         type: string
     secrets:
@@ -13,195 +14,354 @@ on:
       DISCORD_WEBHOOK_URL:
         required: false
 
+env:
+  PARALLEL_WORKERS: 8
+  MAX_DOWNLOADS_PER_CHUNK: 2000
+  JS_PROBE_THREADS: 25
+  DOWNLOAD_CONCURRENCY: 25
+
 jobs:
-  # This single job handles the entire process with clear, separate steps.
-  scan-and-commit:
-    name: "Scan, Consolidate & Notify (${{ inputs.environment_name }})"
+  discover_urls:
+    name: "Discover JS Candidates (${{ inputs.environment_name }})"
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment_name }}
+    outputs:
+      js_count: ${{ steps.count.outputs.count }}
     steps:
-      - name: Checkout Full Git History and Assets
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Required for git diff and for accessing filter files.
+          fetch-depth: 0
 
-      - name: Set up Go, Node & System Tools
-        uses: actions/setup-go@v4
+      - name: Normalize target
+        id: set-domain
+        run: |
+          DOMAIN="${{ inputs.environment_name }}"
+          TARGET_DOMAIN=$(echo "$DOMAIN" | sed 's/-com$/.com/')
+          echo "target_domain=$TARGET_DOMAIN" >> $GITHUB_OUTPUT
+
+      - name: Setup Go & Node
+        uses: actions/setup-go@v5
         with:
           go-version: '1.21'
       - uses: actions/setup-node@v3
         with:
           node-version: '18'
 
-      - name: Install All Dependencies
+      - name: Cache Go/Node/Pip
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ${{ env.GOPATH }}/pkg/mod
+            ${{ env.GOPATH }}/bin
+            ~/.npm
+            ~/.cache/pip
+          key: ${{ runner.os }}-tool-cache-v1
+
+      - name: Install discovery tools
         run: |
-          echo "Installing system packages..."
-          sudo apt-get update && sudo apt-get install -y python3-pip yara git jq
-
-          echo "Installing Go and Node tools..."
-          go install -v github.com/projectdiscovery/katana/cmd/katana@latest
-          go install -v github.com/lc/gau/v2/cmd/gau@latest
-          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-          npm install -g js-beautify
+          go install github.com/projectdiscovery/katana/cmd/katana@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-          
-          echo "Installing Python analysis tools..."
-          pip install git+https://github.com/GerbenJavado/LinkFinder.git
-          
-          git clone https://github.com/m4ll0k/SecretFinder.git /opt/secretfinder
-          pip install -r /opt/secretfinder/requirements.txt
-          echo "/opt/secretfinder" >> $GITHUB_PATH
-          echo "✅ All dependencies installed."
 
-      - name: Discover and Process JS Files (with Content Hashing)
-        id: process_js
+      - name: Run katana crawl (produce candidates)
+        run: |
+          TARGET="${{ steps.set-domain.outputs.target_domain }}"
+          echo "$TARGET" > target.txt
+          katana -list target.txt -jc -silent -d 3 -c 20 -H "User-Agent: Mozilla/5.0" -o katana-out.txt || true
+          # Keep only same-domain candidates
+          grep -iE "^https?://(www\.)?${{ steps.set-domain.outputs.target_domain }}/" katana-out.txt | sort -u > all_candidates.txt || true
+          echo "katana produced $(wc -l < all_candidates.txt || true) candidates."
+
+      - name: Probe candidates with httpx and extract JS URLs
+        run: |
+          if [ ! -s all_candidates.txt ]; then
+            echo "count=0" >> $GITHUB_OUTPUT
+            touch js_urls.txt
+            exit 0
+          fi
+
+          cat all_candidates.txt | httpx -silent -threads ${{ env.JS_PROBE_THREADS }} -json -H "User-Agent: Mozilla/5.0" -o probed.json || true
+
+          # Filter rules:
+          # 1) content_type contains javascript
+          # 2) OR content_length header exists and > 0
+          # 3) OR URL ends with .js (fallback)
+          jq -r '
+            (.[] |
+              select(
+                ((.content_type // "") | test("javascript|x-javascript")) 
+                or ((.content_length // "0") | tonumber > 0)
+                or (.url | test("\\.js($|\\?)"; "i"))
+              ).url
+            )
+          ' probed.json 2>/dev/null > probed_js_urls.txt || true
+
+          # also include any candidate that explicitly ends with .js in case probe missed it
+          grep -iE "\\.js($|\\?)" all_candidates.txt >> probed_js_urls.txt || true
+
+          sort -u -o js_urls.txt probed_js_urls.txt || true
+          COUNT=$(wc -l < js_urls.txt || echo 0)
+          echo "Found $COUNT JS candidate URLs after httpx probe."
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+
+      - name: Upload discovered-js-urls artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: discovered-js-urls
+          path: js_urls.txt
+
+  generate_matrix:
+    name: "Generate chunks"
+    needs: discover_urls
+    if: needs.discover_urls.outputs.js_count != '0'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.split.outputs.matrix }}
+    steps:
+      - name: Download discovered-js-urls
+        uses: actions/download-artifact@v4
+        with:
+          name: discovered-js-urls
+          path: .
+
+      - name: Split into chunks
+        id: split
+        run: |
+          PARALLEL=${{ env.PARALLEL_WORKERS }}
+          mkdir -p chunks
+          total_lines=$(wc -l < js_urls.txt || echo 0)
+          if [ "$total_lines" -eq 0 ]; then
+            echo "matrix=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          lines_per_chunk=$(( (total_lines + PARALLEL - 1) / PARALLEL ))
+          split -d -l $lines_per_chunk js_urls.txt chunks/chunk_
+          CHUNKS_JSON=$(ls -1 chunks/ | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "matrix=$CHUNKS_JSON" >> $GITHUB_OUTPUT
+
+      - name: Upload chunk files
+        uses: actions/upload-artifact@v4
+        with:
+          name: subdomain-chunks-${{ inputs.environment_name }}-${{ github.run_id }}
+          path: chunks/
+
+  process_chunk:
+    name: "Process chunk ${{ matrix.chunk_file }}"
+    needs: generate_matrix
+    if: needs.generate_matrix.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk_file: ${{ fromJson(needs.generate_matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Normalize target
+        id: set-domain
+        run: |
+          DOMAIN="${{ inputs.environment_name }}"
+          TARGET_DOMAIN=$(echo "$DOMAIN" | sed 's/-com$/.com/')
+          echo "target_domain=$TARGET_DOMAIN" >> $GITHUB_OUTPUT
+
+      - name: Cache and setup tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ${{ env.GOPATH }}/pkg/mod
+            ${{ env.GOPATH }}/bin
+            ~/.npm
+            ~/.cache/pip
+          key: ${{ runner.os }}-tool-cache-v1
+
+      - name: Setup Go & Node
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install runtime tools
+        run: |
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          npm install -g js-beautify || true
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Download chunk
+        uses: actions/download-artifact@v4
+        with:
+          name: subdomain-chunks-${{ inputs.environment_name }}-${{ github.run_id }}
+          path: chunks/
+
+      - name: Prepare chunk file
+        run: |
+          CHUNK="chunks/${{ matrix.chunk_file }}"
+          if [ ! -f "$CHUNK" ]; then
+            echo "Chunk not found."
+            exit 0
+          fi
+          mkdir -p js_files_temp/runner_${{ matrix.chunk_file }}
+          cp "$CHUNK" js_files_temp/runner_${{ matrix.chunk_file }}/my_chunk.txt
+          echo "Runner has $(wc -l < js_files_temp/runner_${{ matrix.chunk_file }}/my_chunk.txt) URLs."
+
+      - name: Download and process (probe used earlier; download only filtered URLs)
         env:
           SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
         run: |
-          echo "🎯 Starting scan for target: ${{ vars.TARGET_DOMAIN }}"
-          echo "${{ vars.TARGET_DOMAIN }}" > target.txt
-
-          # --- URL Discovery Phase ---
-          katana -list target.txt -jc -silent -d 5 -c 25 -H "User-Agent: Mozilla/5.0" -o katana-out.txt || true
-          cat target.txt | gau --threads 5 | grep -iE "^https?://(www\.)?${{ vars.TARGET_DOMAIN }}/" > gau-out.txt
-          cat katana-out.txt gau-out.txt | sort -u > all_urls.txt
-          
-          grep -iE '\.js($|\?)' all_urls.txt > all_js_urls.txt
-          grep -ivE '\.js($|\?)' all_urls.txt | httpx -silent -threads 25 -H "User-Agent: Mozilla/5.0" -json -o probed.json || true
-          if [ -s probed.json ]; then
-            jq -r 'select(.content_type != null and (.content_type | test("javascript|x-javascript"))) .url' probed.json >> all_js_urls.txt
-          fi
-          sort -u -o all_js_urls.txt all_js_urls.txt
-          JS_COUNT=$(wc -l < all_js_urls.txt)
-          echo "✅ Found $JS_COUNT unique JS URLs. Proceeding to download and process."
-          echo "js_url_count=$JS_COUNT" >> $GITHUB_OUTPUT
-
-          # --- Advanced Processing Setup ---
-          TEMP_DIR="js_files_temp"
-          mkdir -p "$TEMP_DIR"
-          
+          set -euo pipefail
+          RUNNER_DIR="js_files_temp/runner_${{ matrix.chunk_file }}"
+          ALL_URLS="$RUNNER_DIR/my_chunk.txt"
           WGET_ARGS="--user-agent=Mozilla/5.0 --quiet --no-check-certificate --tries=2 --timeout=20"
-          if [ -n "$SESSION_COOKIE" ]; then WGET_ARGS="$WGET_ARGS --header=Cookie:$SESSION_COOKIE"; fi
-          
-          LIBS_IGNORE_FILE="libs-ignore.txt"
-          LIBS_HASHES_FILE="libs_hashes.txt"
+          if [ -n "${SESSION_COOKIE:-}" ]; then WGET_ARGS="$WGET_ARGS --header=Cookie:${SESSION_COOKIE}"; fi
+          LIBS_IGNORE="libs-ignore.txt"
+          LIBS_HASHES="libs_hashes.txt"
 
-          # --- Core Processing Function (SHA256 Content-Based) ---
           process_url() {
             url="$1"
             [ -z "$url" ] && return
-            
-            # Layer 1 Filter: Ignore based on URL pattern from libs-ignore.txt
-            if [ -f "$LIBS_IGNORE_FILE" ] && grep -qf "$LIBS_IGNORE_FILE" <<< "$url"; then return; fi
+            if [ -f "$LIBS_IGNORE" ] && grep -qf "$LIBS_IGNORE" <<< "$url"; then
+              return
+            fi
 
-            TEMP_FILE=$(mktemp)
-            if wget $WGET_ARGS -O "$TEMP_FILE" "$url" && [ -s "$TEMP_FILE" ]; then
-              CONTENT_HASH=$(sha256sum "$TEMP_FILE" | awk '{print $1}')
-              [ -z "$CONTENT_HASH" ] && { rm -f "$TEMP_FILE"; return; }
-              
-              # Layer 2 Filter: Ignore based on content hash from libs_hashes.txt
-              if [ -f "$LIBS_HASHES_FILE" ] && grep -qF "$CONTENT_HASH" "$LIBS_HASHES_FILE"; then { rm -f "$TEMP_FILE"; return; }; fi
-
-              FINAL_JS_PATH="$TEMP_DIR/${CONTENT_HASH}.js"
-              
-              # Deduplication: Only beautify and move if we haven't seen this content before.
-              if [ ! -f "$FINAL_JS_PATH" ]; then
-                js-beautify -r "$TEMP_FILE" &>/dev/null
-                mv "$TEMP_FILE" "$FINAL_JS_PATH"
-              else
-                rm -f "$TEMP_FILE" # Content already exists, discard download.
+            tmpf=$(mktemp)
+            if wget $WGET_ARGS -O "$tmpf" "$url"; then
+              if [ ! -s "$tmpf" ]; then
+                rm -f "$tmpf"
+                return
               fi
-              
-              # Always record the URL-to-content mapping.
-              echo "${CONTENT_HASH}.js,$url" >> "$TEMP_DIR/manifest.csv"
+              content_hash=$(sha256sum "$tmpf" | awk '{print $1}')
+              if [ -z "$content_hash" ]; then
+                rm -f "$tmpf"
+                return
+              fi
+              if [ -f "$LIBS_HASHES" ] && grep -qF "$content_hash" "$LIBS_HASHES"; then
+                rm -f "$tmpf"
+                return
+              fi
+              final="$RUNNER_DIR/${content_hash}.js"
+              if [ ! -f "$final" ]; then
+                js-beautify -r "$tmpf" &>/dev/null || true
+                mv "$tmpf" "$final"
+              else
+                rm -f "$tmpf"
+              fi
+              echo "${content_hash}.js,$url" >> "$RUNNER_DIR/manifest.csv" || true
             else
-              rm -f "$TEMP_FILE" # Cleanup failed or empty download.
+              rm -f "$tmpf"
             fi
           }
-          export -f process_url; export WGET_ARGS; export TEMP_DIR; export LIBS_IGNORE_FILE; export LIBS_HASHES_FILE
-          
-          cat all_js_urls.txt | xargs -P 25 --no-run-if-empty -I {} bash -c 'process_url "$@"' _ {}
+          export -f process_url
+          export WGET_ARGS
+          export LIBS_IGNORE
+          export LIBS_HASHES
 
-      - name: Consolidate JS Files and Manifest
+          head -n ${{ env.MAX_DOWNLOADS_PER_CHUNK }} "$ALL_URLS" > "$RUNNER_DIR/to_process.txt"
+          cat "$RUNNER_DIR/to_process.txt" | xargs -P ${{ env.DOWNLOAD_CONCURRENCY }} --no-run-if-empty -I {} bash -c 'process_url "$@"' _ {}
+
+      - name: Upload processed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: processed-js-${{ inputs.environment_name }}-${{ matrix.chunk_file }}-${{ github.run_id }}
+          path: js_files_temp/runner_${{ matrix.chunk_file }}/
+
+  consolidate_and_commit:
+    name: "Consolidate & Commit (${{ inputs.environment_name }})"
+    needs: process_chunk
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Normalize target
+        id: set-domain
         run: |
-          TARGET_BASE_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
-          TARGET_FILES_DIR="$TARGET_BASE_DIR/files"
-          TARGET_MANIFEST="$TARGET_BASE_DIR/manifest.csv"
-          TEMP_DIR="js_files_temp"
-          
-          mkdir -p "$TARGET_FILES_DIR"
+          DOMAIN="${{ inputs.environment_name }}"
+          TARGET_DOMAIN=$(echo "$DOMAIN" | sed 's/-com$/.com/')
+          echo "target_domain=$TARGET_DOMAIN" >> $GITHUB_OUTPUT
 
-          echo "Consolidating downloaded files..."
-          if [ ! -d "$TEMP_DIR" ] || [ -z "$(ls -A $TEMP_DIR)" ]; then
-            echo "No new files were downloaded. Nothing to consolidate."
-            exit 0
-          fi
-          
-          # Copy new JS files, but do not overwrite existing ones. This is the core of deduplication.
-          find "$TEMP_DIR" -type f -name "*.js" -exec cp -n {} "$TARGET_FILES_DIR/" \;
+      - name: Download all processed artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_artifacts/
+          if-no-files-found: warn
 
-          # Smartly merge the new manifest with the existing master manifest.
-          if [ -f "$TEMP_DIR/manifest.csv" ]; then
-            # Combine new and old manifest, then sort and unique based on the URL (second column)
-            # to prevent multiple entries for the same URL pointing to the same hash.
-            cat "$TEMP_DIR/manifest.csv" "$TARGET_MANIFEST" 2>/dev/null | sort -u -t, -k2,2 > "${TARGET_MANIFEST}.final"
+      - name: Consolidate files, manifests, and add README
+        run: |
+          TARGET_BASE="js_files/${{ steps.set-domain.outputs.target_domain }}"
+          TARGET_FILES="$TARGET_BASE/files"
+          TARGET_MANIFEST="$TARGET_BASE/manifest.csv"
+          mkdir -p "$TARGET_FILES"
+          TMP_MAN="all_artifacts/merged_manifest.tmp"
+
+          find all_artifacts/ -type f -name "*.js" -exec cp -n {} "$TARGET_FILES/" \; || true
+          find all_artifacts/ -type f -name "manifest.csv" -exec cat {} + >> "$TMP_MAN" || true
+
+          if [ -f "$TMP_MAN" ]; then
+            touch "$TARGET_MANIFEST"
+            cat "$TMP_MAN" "$TARGET_MANIFEST" | sort -u -t, -k2,2 > "${TARGET_MANIFEST}.final" || true
             mv "${TARGET_MANIFEST}.final" "$TARGET_MANIFEST"
-            echo "✅ Manifest file updated."
+            rm -f "$TMP_MAN"
+            echo "Manifest consolidated: $(wc -l < $TARGET_MANIFEST || true)"
+          else
+            echo "No new manifest entries."
           fi
-          
-          rm -rf "$TEMP_DIR"
-          echo "✅ Consolidation complete."
 
-      - name: Detect and Commit Changes
+          # Write a README that shows how to lookup URL by hash
+          README="$TARGET_BASE/README_MANIFEST.md"
+          cat > "$README" <<'EOF'
+README - JS manifest lookup
+----------------------------------
+This manifest maps content-hash filenames to original URLs in CSV format:
+  <hash>.js,<original_url>
+
+To find the original URL for a given changed JS file (example: 9f2a... .js):
+  grep '^9f2a' manifest.csv
+
+To find by full filename:
+  grep '9f2a...' manifest.csv
+
+To show only the URL column for a specific hash:
+  grep '^9f2a' manifest.csv | cut -d',' -f2-
+
+Keep this file under version control with the manifest so you can trace which URL produced a particular content hash.
+EOF
+
+      - name: Commit changes
         id: git_commit
         run: |
-          TARGET_BASE_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
+          TARGET_BASE="js_files/${{ steps.set-domain.outputs.target_domain }}"
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action-bot@github.com"
-
-          git add -A "$TARGET_BASE_DIR/"
-
+          git add -A "$TARGET_BASE/"
           if git diff --staged --quiet; then
-            echo "✅ No changes detected in the repository. Workflow finished successfully."
             echo "changes_detected=false" >> $GITHUB_OUTPUT
             exit 0
           fi
-
-          echo "💾 Changes detected. Committing to the repository."
-          git commit -m "[JS Scan] Update files for ${{ vars.TARGET_DOMAIN }}"
-          
-          echo "🔄 Syncing with remote repository..."
-          git pull origin main --rebase
-          
-          echo "⬆️ Pushing changes..."
-          git push origin main
-          
+          git commit -m "[JS Scan] Update files for ${{ steps.set-domain.outputs.target_domain }}" || true
+          git pull origin main --rebase || true
+          git push origin main || true
           echo "changes_detected=true" >> $GITHUB_OUTPUT
-          
-          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD -- "$TARGET_BASE_DIR/")
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD -- "$TARGET_BASE/" || true)
           echo "changed_files<<EOF" >> $GITHUB_OUTPUT
           echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Analyze Changes and Send Notification
+      - name: Analyze & notify
         if: steps.git_commit.outputs.changes_detected == 'true'
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          TARGET_DOMAIN: ${{ vars.TARGET_DOMAIN }}
+          TARGET_DOMAIN: ${{ steps.set-domain.outputs.target_domain }}
         run: |
-          CHANGED_FILES="${{ steps.git_commit.outputs.changed_files }}"
-          
-          CHANGED_JS_FILES=$(echo "$CHANGED_FILES" | grep '\.js$' || true)
-          
-          if [ -n "$CHANGED_JS_FILES" ]; then
-            echo "🔬 Analyzing changed JS files..."
-            chmod +x analyze_js.sh
-            echo "$CHANGED_JS_FILES" | ./analyze_js.sh
-          else
-            echo "✅ No changed JS files to analyze, only manifest or other files were updated."
+          CHANGED_JS=$(echo "${{ steps.git_commit.outputs.changed_files }}" | grep '\.js$' || true)
+          if [ -n "$CHANGED_JS" ]; then
+            chmod +x analyze_js.sh || true
+            echo "$CHANGED_JS" | ./analyze_js.sh || true
           fi
-
-          echo "🚀 Sending notification..."
-          chmod +x send_notification.sh
-          ./send_notification.sh
+          chmod +x send_notification.sh || true
+          ./send_notification.sh || true

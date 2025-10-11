@@ -1,3 +1,4 @@
+// extract-js.js
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -14,72 +15,75 @@ if (!fs.existsSync(outputDir)) {
     fs.mkdirSync(outputDir);
 }
 
+// A single index file for this run to map hash to URL
+const indexFilePath = path.join(outputDir, 'index.txt');
+
 function sha256(data) {
     return crypto.createHash('sha256').update(data).digest('hex');
 }
 
+// Use a Set to avoid duplicate processing within the same run
+const processedHashes = new Set();
+
+async function saveJs(content, sourceUrl) {
+    if (!content || content.length < 20) return; // Ignore tiny/empty scripts
+
+    const hash = sha256(content);
+    if (processedHashes.has(hash)) return;
+
+    processedHashes.add(hash);
+    const fileName = `${hash}.js`;
+    const filePath = path.join(outputDir, fileName);
+
+    fs.writeFileSync(filePath, content);
+    fs.appendFileSync(indexFilePath, `${hash},${sourceUrl}\n`);
+    console.log(`Saved: ${sourceUrl} -> ${fileName}`);
+}
+
 (async () => {
-    const browser = await chromium.launch({
-        headless: true,
-        args: ['--no-sandbox', '--disable-dev-shm-usage']
-    });
-    const context = await browser.newContext();
-    const page = await context.newPage();
-
-    const capturedJs = new Set();
-
-    page.on('response', async (response) => {
-        const contentType = response.headers()['content-type'] || '';
-        const responseUrl = response.url();
-        if (contentType.includes('javascript') || responseUrl.endsWith('.js')) {
-            try {
-                const body = await response.body();
-                const hash = sha256(body);
-                if (!capturedJs.has(hash)) {
-                    capturedJs.add(hash);
-                    const fileName = path.join(outputDir, `${hash}.js`);
-                    fs.writeFileSync(fileName, `${responseUrl}\n`);
-                    fs.appendFileSync(fileName, body);
-                }
-            } catch (error) {
-                // Ignore errors for responses that might not have a body
-            }
-        }
-    });
-
+    let browser;
     try {
-        await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+        browser = await chromium.launch({
+            headless: true,
+            args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+        });
+        const context = await browser.newContext({
+            ignoreHTTPSErrors: true,
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        });
+        const page = await context.newPage();
 
-        const scriptTags = await page.evaluate(() => {
-            const scripts = [];
-            document.querySelectorAll('script').forEach(script => {
-                if (script.src) {
-                    scripts.push({ src: script.src, content: null });
-                } else if (script.textContent.trim().length > 0) {
-                    scripts.push({ src: null, content: script.textContent });
+        page.on('response', async (response) => {
+            const contentType = response.headers()['content-type'] || '';
+            const responseUrl = response.url();
+            if (contentType.includes('javascript') || responseUrl.endsWith('.js')) {
+                try {
+                    const body = await response.buffer();
+                    await saveJs(body, responseUrl);
+                } catch (error) {
+                    // Ignore errors for responses that might fail (e.g., redirects)
                 }
-            });
-            return scripts;
+            }
         });
 
-        for (const script of scriptTags) {
-            if (script.src) {
-                // Already handled by the response listener
-            } else if (script.content) {
-                const hash = sha256(script.content);
-                if (!capturedJs.has(hash)) {
-                    capturedJs.add(hash);
-                    const fileName = path.join(outputDir, `${hash}.js`);
-                    const inlineUrl = `${url}#inline-${hash.substring(0, 8)}`;
-                    fs.writeFileSync(fileName, `${inlineUrl}\n`);
-                    fs.appendFileSync(fileName, script.content);
-                }
-            }
+        await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
+        await page.waitForTimeout(5000); // Extra wait for lazy-loaded/SPA content
+
+        const inlineScripts = await page.evaluate(() => 
+            Array.from(document.querySelectorAll('script:not([src])'))
+                 .map(script => script.textContent)
+        );
+
+        for (const scriptContent of inlineScripts) {
+            const inlineUrl = `${url}#inline`;
+            await saveJs(scriptContent, inlineUrl);
         }
 
     } catch (error) {
-        console.error(`Error processing ${url}:`, error.message);
+        console.error(`Error processing ${url}: ${error.message}`);
     } finally {
-        await browser.close();
+        if (browser) {
+            await browser.close();
+        }
     }
 })();

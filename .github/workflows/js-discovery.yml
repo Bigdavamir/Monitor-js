@@ -69,41 +69,67 @@ jobs:
           path: chunks/
 
   extract-js:
-    name: "Extract JS (Chunk ${{ matrix.chunk_file }})"
-    needs: generate-matrix
     runs-on: ubuntu-latest
+    needs: generate-matrix
+    if: needs.generate-matrix.outputs.matrix != '[]'
     strategy:
       fail-fast: false
-      matrix:
-        chunk_file: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
       - name: Set up Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: '18'
-      - name: Install Playwright and dependencies
-        run: npx playwright install --with-deps chromium
+          node-version: '18' # Using Node.js v18
+
       - name: Download subdomain chunk
         uses: actions/download-artifact@v4
         with:
-          name: subdomain-chunks-${{ github.run_id }}
-          path: chunks/
-      - name: Run Playwright JS Extraction
+          name: chunks
+          path: chunks
+
+      # --- FIX IS HERE ---
+      # This step installs both the Playwright library AND its browsers.
+      # It MUST run before the script execution.
+      - name: Install Playwright and dependencies
         run: |
-          CHUNK_FILE="chunks/${{ matrix.chunk_file }}"
+          echo "Installing Playwright npm package..."
+          npm install playwright
+          echo "Installing Playwright browsers..."
+          npx playwright install --with-deps chromium
+          echo "Installation complete."
+        
+      - name: Run Playwright JS Extraction
+        id: run-extraction
+        run: |
+          CHUNK_FILE="chunks/chunk_${{ matrix.chunk_id }}"
+          echo "Processing chunk file: $CHUNK_FILE"
+          
+          # Check if the chunk file exists and is not empty
+          if [ ! -s "$CHUNK_FILE" ]; then
+            echo "Chunk file is empty or does not exist. Skipping."
+            exit 0
+          fi
+          
+          # Loop through each host in the chunk file and run the script
           while IFS= read -r host; do
-            echo "Crawling: $host"
-            # The node script will create the 'captured_js' directory
-            node extract-js.js "$host"
+            if [ -n "$host" ]; then
+              echo "Crawling: $host"
+              # The script must be in the root directory
+              node extract-js.js "$host"
+            fi
           done < "$CHUNK_FILE"
+
       - name: Upload Captured JS Files
         uses: actions/upload-artifact@v4
         with:
-          name: captured-js-${{ matrix.chunk_file }}-${{ github.run_id }}
+          name: js-files-${{ matrix.chunk_id }}
           path: captured_js/
-          if-no-files-found: ignore
+          if-no-files-found: ignore # Don't fail if a chunk produces no JS
+
 
   consolidate-and-commit:
     name: "Consolidate, Deduplicate & Commit"

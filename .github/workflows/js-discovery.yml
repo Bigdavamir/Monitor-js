@@ -1,0 +1,159 @@
+name: JS Discovery Workflow
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */12 * * *'
+
+jobs:
+  discover-and-filter:
+    runs-on: ubuntu-latest
+    outputs:
+      found_hosts: ${{ steps.check_output.outputs.found_hosts }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y wget
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+
+      - name: Discover and Filter Subdomains
+        id: discover_step
+        run: |
+          TARGET_DOMAIN="${{ vars.TARGET_DOMAIN }}"
+          echo "Discovering subdomains for $TARGET_DOMAIN"
+          ~/go/bin/subfinder -d "$TARGET_DOMAIN" -silent | ~/go/bin/httpx -status-code -mc 200,301,302,307 -silent > live_subdomains.txt
+
+      - name: Check for Output
+        id: check_output
+        run: |
+          if [ -s live_subdomains.txt ]; then
+            echo "found_hosts=true" >> $GITHUB_OUTPUT
+            echo "Live subdomains found. Proceeding to the next job."
+          else
+            echo "found_hosts=false" >> $GITHUB_OUTPUT
+            echo "No live subdomains found. Skipping the next jobs."
+          fi
+
+      - name: Upload Live Subdomains Artifact
+        if: steps.check_output.outputs.found_hosts == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-subdomains
+          path: live_subdomains.txt
+
+  generate-matrix:
+    needs: discover-and-filter
+    if: needs.discover-and-filter.outputs.found_hosts == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Download Live Subdomains Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: live-subdomains
+          path: .
+
+      - name: Generate Matrix
+        id: set-matrix
+        run: |
+          split -l 50 live_subdomains.txt chunk_
+          ls chunk_* > chunks.txt
+          MATRIX=$(jq -R -s -c 'split("\n") | map(select(length > 0))' chunks.txt)
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+
+      - name: Upload Chunks Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: subdomain-chunks
+          path: chunk_*
+
+  extract-js-with-playwright:
+    needs: generate-matrix
+    if: needs.generate-matrix.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Download Chunks Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: subdomain-chunks
+          path: .
+
+      - name: Extract JS Files
+        run: |
+          mkdir -p captured_js/
+          while IFS= read -r url; do
+            echo "Processing $url"
+            node extract-js.js "$url"
+          done < "${{ matrix.chunk }}"
+
+      - name: Upload Captured JS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: captured-js-${{ matrix.chunk }}
+          path: captured_js/
+
+  consolidate-and-commit:
+    needs: extract-js-with-playwright
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download All Captured JS Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: captured-js-*
+          path: all_captured_js/
+
+      - name: Consolidate and Commit
+        run: |
+          TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
+          mkdir -p "$TARGET_DIR"
+
+          find all_captured_js -type f -name "*.js" | while read -r file; do
+            HASH=$(basename "$file" .js)
+            URL=$(head -n 1 "$file")
+
+            if [ ! -f "$TARGET_DIR/$HASH.js" ]; then
+              echo "New JS file found: $HASH from $URL"
+              tail -n +2 "$file" > "$TARGET_DIR/$HASH.js"
+              echo "$HASH,$URL,$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$TARGET_DIR/index.csv"
+
+              if [ -f "./send_notification.sh" ]; then
+                ./send_notification.sh "$HASH" "$URL"
+              fi
+            fi
+          done
+
+      - name: Commit Changes
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add "js_files/"
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update JS files for ${{ vars.TARGET_DOMAIN }}"
+            git push
+          fi

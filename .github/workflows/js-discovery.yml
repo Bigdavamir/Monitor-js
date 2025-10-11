@@ -73,14 +73,11 @@ jobs:
           path: chunks/
 
   extract-js:
-    # FIX: Added a descriptive name for the job using the matrix variable
     name: "3. Extract JS (Chunk ${{ matrix.chunk_file }})"
     runs-on: ubuntu-latest
     needs: generate-matrix
-    # The 'if' condition is not needed here, as the matrix will be empty and the job won't run anyway.
     strategy:
       fail-fast: false
-      # FIX: The matrix syntax requires a key. 'chunk_file' is the key we'll use.
       matrix:
         chunk_file: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
     steps:
@@ -93,16 +90,15 @@ jobs:
       - name: Download subdomain chunk
         uses: actions/download-artifact@v4
         with:
-          # FIX: Downloading the artifact with the correct run-specific name
           name: subdomain-chunks-${{ github.run_id }}
-          path: . # Download to the root
+          # FIX: Download the artifact *into* a 'chunks' directory
+          path: chunks
       - name: Install Playwright and dependencies
         run: |
           npm install playwright
           npx playwright install --with-deps chromium
       - name: Run Playwright JS Extraction
         run: |
-          # The chunk files are now in the 'chunks' directory
           CHUNK_FILE="chunks/${{ matrix.chunk_file }}"
           echo "Processing chunk file: $CHUNK_FILE"
           
@@ -114,17 +110,16 @@ jobs:
           while IFS= read -r host; do
             if [ -n "$host" ]; then
               echo "Crawling: $host"
-              # Assuming 'extract-js.js' is in the root of the repository
               node extract-js.js "$host"
             fi
           done < "$CHUNK_FILE"
       - name: Upload Captured JS Files
         uses: actions/upload-artifact@v4
         with:
-          # FIX: Using the matrix variable correctly and adding run_id for unique naming
           name: captured-js-${{ matrix.chunk_file }}-${{ github.run_id }}
           path: captured_js/
           if-no-files-found: ignore
+
 
   consolidate-and-commit:
     name: "4. Consolidate, Deduplicate & Commit"

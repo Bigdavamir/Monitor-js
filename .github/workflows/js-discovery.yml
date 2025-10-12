@@ -1,6 +1,7 @@
 # .github/workflows/js-discovery.yml
-# FINAL VERSION 2 - Handles "No Artifacts Found" scenario
-name: JS Monitor (Eddie's 9-Step Parallel Workflow)
+# FINAL VERSION 4 - Advanced Architecture based on Eddie's insight
+# This workflow uses gau to find both static JS and HTML pages to feed into Playwright.
+name: JS Monitor (Eddie's Advanced Discovery Workflow)
 
 on:
   workflow_dispatch:
@@ -11,96 +12,207 @@ permissions:
   contents: write
 
 jobs:
-  # JOB 1: Gathers all URLs and splits them into chunks for parallel processing.
-  discover_and_split_urls:
-    name: "1. Discover and Split URLs"
+  # JOB 1: Discover all URLs and split them into two categories: static JS and crawl targets.
+  discover_urls:
+    name: "1. Discover All URL Types"
+    runs-on: ubuntu-latest
+    outputs:
+      static_js_found: ${{ steps.output_handler.outputs.static_js_found }}
+      crawl_targets_found: ${{ steps.output_handler.outputs.crawl_targets_found }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+      
+      - name: Install Tools
+        run: |
+          go install -v github.com/lc/gau/v2/cmd/gau@latest
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run Gau for Comprehensive Discovery
+        id: discovery
+        env:
+          TARGET_DOMAIN: ${{ vars.TARGET_DOMAIN }}
+        run: |
+          gau --threads 5 "$TARGET_DOMAIN" > all_urls.txt
+          echo "Gau discovered $(wc -l < all_urls.txt) total URLs."
+
+      - name: Create Static JS List (Path A)
+        run: |
+          grep -i '\.js' all_urls.txt | \
+          grep -ivE "\.(css|xml|json|txt|md|jpg|jpeg|png|gif|svg|ico|woff|woff2|pdf|zip)$" | \
+          sed 's/[?#].*//' | \
+          sort -u | \
+          grep '^https://' > sanitized_js_urls.txt
+          
+          httpx -list sanitized_js_urls.txt -silent -mc 200 -ct -match-string "javascript" > live_static_js.txt
+          echo "Found $(wc -l < live_static_js.txt) live static JS URLs."
+
+      - name: Create Crawl Target List (Path B)
+        run: |
+          # Exclude common asset files to get clean endpoints and HTML pages
+          grep -ivE "\.(js|css|xml|json|txt|md|jpg|jpeg|png|gif|svg|ico|woff|woff2|pdf|zip|mp4|mov)$" all_urls.txt | \
+          sed 's/[?#].*//' | \
+          sort -u > potential_crawl_targets.txt
+          
+          # Probe targets and select a random sample of 20 live pages to avoid long runtimes
+          httpx -list potential_crawl_targets.txt -silent -mc 200 -cl -ct | \
+          grep "HTML" | cut -d' ' -f1 | sort -R | head -n 20 > crawl_targets.txt
+          echo "Selected $(wc -l < crawl_targets.txt) high-value pages for deep crawling."
+
+      - name: Set Outputs
+        id: output_handler
+        run: |
+          echo "static_js_found=$( [ -s live_static_js.txt ] && echo true || echo false )" >> $GITHUB_OUTPUT
+          echo "crawl_targets_found=$( [ -s crawl_targets.txt ] && echo true || echo false )" >> $GITHUB_OUTPUT
+      
+      - name: Upload Static JS Artifact
+        if: steps.output_handler.outputs.static_js_found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-js-list-${{ github.run_id }}
+          path: live_static_js.txt
+
+      - name: Upload Crawl Targets Artifact
+        if: steps.output_handler.outputs.crawl_targets_found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-targets-${{ github.run_id }}
+          path: crawl_targets.txt
+
+  # JOB 2: Run headless browser on the discovered crawl targets.
+  dynamic_discovery_headless:
+    name: "2. Dynamic Discovery via Headless"
+    needs: discover_urls
+    if: needs.discover_urls.outputs.crawl_targets_found == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Crawl Targets
+        uses: actions/download-artifact@v4
+        with:
+          name: crawl-targets-${{ github.run_id }}
+      
+      - name: Setup Node and Playwright
+        run: |
+          sudo apt-get update && sudo apt-get install -y nodejs npm
+          npm install playwright
+          npx playwright install --with-deps
+
+      - name: Crawl Targets and Extract Dynamic JS
+        env:
+          TARGET_DOMAIN: ${{ vars.TARGET_DOMAIN }}
+        run: |
+          cat << 'EOF' > crawl.js
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          const urlsToCrawl = fs.readFileSync('crawl_targets.txt', 'utf-8').split('\n').filter(Boolean);
+          const dynamicJsUrls = new Set();
+          
+          (async () => {
+            const browser = await chromium.launch();
+            console.log(`Starting to crawl ${urlsToCrawl.length} target(s)...`);
+            for (const url of urlsToCrawl) {
+              const page = await browser.newPage();
+              page.on('request', r => { if (r.url().endsWith('.js')) { dynamicJsUrls.add(r.url().split(/[?#]/)[0]); } });
+              try {
+                console.log(`Crawling: ${url}`);
+                await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
+              } catch (e) {
+                console.error(`Failed to crawl ${url}: ${e.message}`);
+              } finally {
+                await page.close();
+              }
+            }
+            await browser.close();
+            fs.writeFileSync('dynamic_js.txt', Array.from(dynamicJsUrls).join('\n'));
+            console.log(`Discovered ${dynamicJsUrls.size} unique dynamic JS URLs.`);
+          })();
+          EOF
+          
+          node crawl.js
+          # Also crawl the main domain as a fallback
+          echo "https://${TARGET_DOMAIN}" >> crawl_targets.txt
+          node crawl.js
+
+      - name: Upload Dynamic JS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dynamic-js-list-${{ github.run_id }}
+          path: dynamic_js.txt
+          if-no-files-found: ignore
+  
+  # JOB 3: Consolidate all JS sources and split them into chunks.
+  consolidate_and_split:
+    name: "3. Consolidate and Split"
+    needs: [discover_urls, dynamic_discovery_headless]
+    if: always()
     runs-on: ubuntu-latest
     outputs:
       matrix_json: ${{ steps.split_files.outputs.matrix_json }}
       chunk_count: ${{ steps.split_files.outputs.count }}
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Download Static JS List
+        uses: actions/download-artifact@v4
+        with:
+          name: static-js-list-${{ github.run_id }}
+          path: .
+        continue-on-error: true
 
-      - name: Setup Tools
+      - name: Download Dynamic JS List
+        uses: actions/download-artifact@v4
+        with:
+          name: dynamic-js-list-${{ github.run_id }}
+          path: .
+        continue-on-error: true
+
+      - name: Consolidate All JS URLs
         run: |
-          go install -v github.com/lc/gau/v2/cmd/gau@latest
-          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-          sudo apt-get update && sudo apt-get install -y nodejs npm jq
-          npm install playwright
-          npx playwright install --with-deps
-
-      - name: Run Discovery Steps (1-6)
-        id: discovery
-        env:
-          TARGET_DOMAIN: ${{ vars.TARGET_DOMAIN }}
-        run: |
-          # Steps 1-4 (GAU, Filter, Sanitize)
-          gau --verbose "$TARGET_DOMAIN" | \
-          grep -i '\.js' | \
-          grep -ivE "\.(css|xml|json|txt|md|jpg|jpeg|png|gif|svg|ico|woff|woff2|pdf|zip)$" | \
-          sed 's/[?#].*//' | \
-          sort -u | \
-          grep '^https://' > sanitized_urls.txt
-
-          # Step 5 (Validate Static JS)
-          httpx -list sanitized_urls.txt -silent -mc 200 -ct -match-string "javascript" > live_static_js.txt
-
-          # Step 6 (Discover Dynamic JS & Consolidate)
-          cat << 'EOF' > crawl.js
-          const { chromium } = require('playwright');
-          const fs = require('fs');
-          (async () => {
-            const browser = await chromium.launch();
-            const page = await browser.newPage();
-            const dynamicJsUrls = new Set();
-            page.on('request', r => { if (r.url().endsWith('.js')) { dynamicJsUrls.add(r.url().split(/[?#]/)[0]); } });
-            try { await page.goto(`https://${process.env.TARGET_DOMAIN}`, { waitUntil: 'networkidle', timeout: 45000 }); }
-            catch (e) { console.error(`Crawl failed: ${e.message}`); }
-            await browser.close();
-            fs.writeFileSync('dynamic_js.txt', Array.from(dynamicJsUrls).join('\n'));
-          })();
-          EOF
-          node crawl.js
+          touch live_static_js.txt dynamic_js.txt # Ensure files exist
           cat live_static_js.txt dynamic_js.txt | sort -u > all_live_js.txt
-          echo "Total unique JS URLs found: $(wc -l < all_live_js.txt)"
+          echo "Total unique JS URLs from all sources: $(wc -l < all_live_js.txt)"
 
       - name: Split URL List into Chunks
         id: split_files
         run: |
+          if [ ! -s all_live_js.txt ]; then
+            echo "No JS files found to process."
+            echo "count=0" >> $GITHUB_OUTPUT
+            echo "matrix_json=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
           mkdir -p url_chunks
-          # Split into chunks of 100 URLs each
           split -l 100 -d -a 2 all_live_js.txt url_chunks/chunk_
           
           CHUNK_COUNT=$(ls url_chunks/ | wc -l)
           echo "Split URLs into $CHUNK_COUNT chunks for parallel processing."
           echo "count=$CHUNK_COUNT" >> $GITHUB_OUTPUT
           
-          if [ "$CHUNK_COUNT" -gt 0 ]; then
-            MATRIX_JSON=$(seq 0 $((CHUNK_COUNT - 1)) | jq -c --slurp .)
-          else
-            MATRIX_JSON="[]"
-          fi
+          MATRIX_JSON=$(seq 0 $((CHUNK_COUNT - 1)) | jq -c --slurp .)
           echo "Generated Matrix: $MATRIX_JSON"
           echo "matrix_json=${MATRIX_JSON}" >> $GITHUB_OUTPUT
 
       - name: Upload URL Chunks
+        if: steps.split_files.outputs.count > 0
         uses: actions/upload-artifact@v4
         with:
           name: subdomain-chunks-${{ github.run_id }}
           path: url_chunks/
 
-  # JOB 2: Processes each chunk of URLs in parallel.
+  # JOB 4: Processes each chunk of URLs in parallel (Unchanged).
   process_js_chunks:
-    name: "2. Process Chunk ${{ matrix.chunk_id }}"
-    needs: discover_and_split_urls
-    if: needs.discover_and_split_urls.outputs.chunk_count > 0
+    name: "4. Process Chunk ${{ matrix.chunk_id }}"
+    needs: consolidate_and_split
+    if: needs.consolidate_and_split.outputs.chunk_count > 0
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        chunk_id: ${{ fromJson(needs.discover_and_split_urls.outputs.matrix_json) }}
+        chunk_id: ${{ fromJson(needs.consolidate_and_split.outputs.matrix_json) }}
     
     steps:
       - name: Checkout Code
@@ -113,16 +225,13 @@ jobs:
           path: url_chunks
 
       - name: Run Processing Steps (7-9) on Chunk
-        id: process
         env:
           TARGET_DOMAIN: ${{ vars.TARGET_DOMAIN }}
         run: |
           CHUNK_ID=$(printf "%02d" ${{ matrix.chunk_id }})
           MY_CHUNK_FILE="url_chunks/chunk_${CHUNK_ID}"
-          
           if [ ! -f "$MY_CHUNK_FILE" ]; then echo "Chunk file not found, skipping."; exit 0; fi
           
-          # Step 7 & 8 (Hash and find new files)
           while read url; do
             if content=$(curl -s -L --max-time 15 "$url"); then
               if [ -n "$content" ]; then
@@ -143,7 +252,6 @@ jobs:
 
           if [ ! -s new_files_unfiltered.csv ]; then echo "No new files in this chunk."; exit 0; fi
 
-          # Step 9 (Filter Libraries)
           FINAL_NEW_FILES="final_new_files.csv"
           PATTERNS="jquery|react|vue|angular|bootstrap|moment|lodash|vimeo|polyfill|sdk|sentry"
           while IFS=, read -r url hash; do
@@ -163,9 +271,9 @@ jobs:
           path: final_new_files.csv
           if-no-files-found: ignore
 
-  # JOB 3: Consolidates all results and sends a single notification.
+  # JOB 5: Consolidates all results and sends a single notification (Unchanged).
   consolidate_and_notify:
-    name: "3. Consolidate and Notify"
+    name: "5. Consolidate and Notify"
     needs: process_js_chunks
     if: always()
     runs-on: ubuntu-latest
@@ -178,11 +286,9 @@ jobs:
       - name: Download All Final Results
         uses: actions/download-artifact@v4
         with:
-          name: final-results-${{ github.run_id }}
           path: all_results/
           pattern: final-results-${{ github.run_id }}-*
           merge-multiple: true
-          # --- THIS IS THE FIX ---
           if-no-files-found: 'warn' 
 
       - name: Consolidate and Commit

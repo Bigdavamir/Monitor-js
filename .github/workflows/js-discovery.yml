@@ -37,7 +37,7 @@ jobs:
           # Steps 1-4 (GAU, Filter, Sanitize)
           gau --verbose "$TARGET_DOMAIN" | \
           grep -i '\.js' | \
-          grep -ivE "\.(css|xml|json|txt|md|jpg|jpeg|png|gif|svg|ico|woff|woff2|pdf|zip)$" | \
+          grep -ivE "\.(css|xml|json|txt|md|jpg|jpeg|png|gif|exe|svg|ico|woff|woff2|pdf|zip)$" | \
           sed 's/[?#].*//' | \
           sort -u | \
           grep '^https://' > sanitized_urls.txt

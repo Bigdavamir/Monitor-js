@@ -1,5 +1,5 @@
 # .github/workflows/js-discovery.yml
-# FINAL RESILIENT VERSION
+# FINAL VERSION 2 - Handles "No Artifacts Found" scenario
 name: JS Monitor (Eddie's 9-Step Parallel Workflow)
 
 on:
@@ -124,7 +124,6 @@ jobs:
           
           # Step 7 & 8 (Hash and find new files)
           while read url; do
-            # ** FIX 1: Check if curl succeeds before processing **
             if content=$(curl -s -L --max-time 15 "$url"); then
               if [ -n "$content" ]; then
                 hash=$(echo -n "$content" | sha256sum | awk '{print $1}')
@@ -148,7 +147,6 @@ jobs:
           FINAL_NEW_FILES="final_new_files.csv"
           PATTERNS="jquery|react|vue|angular|bootstrap|moment|lodash|vimeo|polyfill|sdk|sentry"
           while IFS=, read -r url hash; do
-            # ** FIX 2: Check if curl succeeds before filtering **
             if content=$(curl -s -L --max-time 15 "$url" | head -n 20); then
               if ! echo "$content" | grep -iqE "$PATTERNS"; then
                 echo "$url,$hash" >> "$FINAL_NEW_FILES"
@@ -184,6 +182,8 @@ jobs:
           path: all_results/
           pattern: final-results-${{ github.run_id }}-*
           merge-multiple: true
+          # --- THIS IS THE FIX ---
+          if-no-files-found: 'warn' 
 
       - name: Consolidate and Commit
         id: consolidate

@@ -1,24 +1,21 @@
-# .github/workflows/playwright-js-monitor.yml
-# FINAL AND CORRECTED VERSION
-name: JS Monitor - Playwright Edition
+# .github/workflows/js-discovery.yml
+name: JS Discovery Pipeline (Multi-Stage Funnel)
 
 on:
   workflow_dispatch:
   schedule:
     - cron: '0 */12 * * *'
-  push:
-    branches:
-      - 'main'
 
-# FIX: Grant write permissions to the GITHUB_TOKEN for this workflow
 permissions:
   contents: write
+
 jobs:
-  discover-and-filter:
-    name: "1. Discover & Filter URLs (Hybrid Strategy v4)"
+  # JAB 1: فقط کشف غیرفعال URL های JS - سریع و سبک
+  discover-passive-js:
+    name: "1. Passive JS URL Discovery"
     runs-on: ubuntu-latest
     outputs:
-      live_urls_found: ${{ steps.check_file.outputs.found }}
+      js_urls_found: ${{ steps.check_file.outputs.found }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -30,238 +27,183 @@ jobs:
         run: |
           go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-          go install -v github.com/lc/gau/v2/cmd/gau@latest
+          go install -v github.com/projectdiscovery/katana/cmd/katana@latest
+          go install -v github.com/tomnomnom/waybackurls@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
           
-      - name: "Robust Discovery Pipeline with Parameter Stripping"
+      - name: "Discover & Filter Static JS URLs"
         run: |
-          # === STAGE 1: Get high-quality, live subdomain seeds ===
-          echo "INFO: Stage 1/5 - Discovering live subdomains for ${{ vars.TARGET_DOMAIN }}..."
+          # Stage 1: Get live subdomain seeds
+          echo "INFO: Discovering live subdomains for ${{ vars.TARGET_DOMAIN }}..."
           subfinder -d "${{ vars.TARGET_DOMAIN }}" -silent | httpx -silent -mc 200,301,302,307 > live_subdomains.txt
           echo "INFO: Found $(wc -l < live_subdomains.txt) live subdomains."
 
-          # === STAGE 2: Run gau in VERBOSE mode ===
-          echo "INFO: Stage 2/5 - Fetching historical URLs for each subdomain (verbose mode)..."
-          cat live_subdomains.txt | gau --threads 20 --verbose > gau_urls.txt
-          echo "INFO: Found $(wc -l < gau_urls.txt) historical URLs from gau."
-
-          # === STAGE 3: Combine and apply aggressive pre-filter ===
-          echo "INFO: Stage 3/5 - Combining lists and applying aggressive extension/path filter..."
-          cat live_subdomains.txt gau_urls.txt | sort -u > combined_urls.txt
+          # Stage 2: Crawl for JS links using Katana
+          echo "INFO: Using Katana to crawl for initial JS files..."
+          # -jc: Javascript Crawl, -d 3: Crawl depth, -aff: Allow Foreign Files (for CDNs)
+          katana -list live_subdomains.txt -jc -d 3 -aff -silent -o katana_urls.txt
           
-          EXT_FILTER="\.(jpg|jpeg|png|gif|bmp|svg|webp|ico|css|woff|woff2|ttf|eot|otf|pdf|zip|gz|tar|rar|bz2|7z|exe|msi|bin|dmg|pkg|deb|rpm|doc|docx|xls|xlsx|ppt|pptx|mp3|mp4|mov|avi|mkv|webm|iso|csv|xml|json)$"
-          grep -Eiv "$EXT_FILTER" combined_urls.txt | \
-          grep -Eiv "/(vendor|assets|lib|libs|third-party|node_modules|static)/" > potential_targets_with_params.txt
+          # Stage 3: Gather historical JS links from Wayback Machine
+          echo "INFO: Using waybackurls to find historical JS files..."
+          cat live_subdomains.txt | waybackurls > wayback_urls.txt
+
+          # Stage 4: Combine, filter strictly for .js, strip parameters, and deduplicate
+          echo "INFO: Combining, filtering, and deduplicating results..."
+          cat katana_urls.txt wayback_urls.txt | grep -i '\.js' | sed 's/[?#].*//' | sort -u > discovered-js-urls.txt
           
-          echo "INFO: Reduced to $(wc -l < potential_targets_with_params.txt) URLs after initial filtering."
+          echo "SUCCESS: Discovered $(wc -l < discovered-js-urls.txt) unique potential JS URLs."
 
-          # === STAGE 4: Strip URL parameters and deduplicate ===
-          # This is the optimization you suggested. It dramatically reduces the workload.
-          echo "INFO: Stage 4/5 - Stripping parameters and deduplicating URLs..."
-          sed 's/\?.*//' potential_targets_with_params.txt | sort -u > unique_potential_targets.txt
-          echo "INFO: Reduced to $(wc -l < unique_potential_targets.txt) unique URLs after parameter stripping."
-
-          # === STAGE 5: Final validation probe with an optimized httpx ===
-          echo "INFO: Stage 5/5 - Starting final validation probe with httpx (10s timeout per URL)..."
-          cat unique_potential_targets.txt | httpx -silent -mc 200,301,302,307 -t 100 -timeout 10 -o live_urls.txt
-          echo "INFO: Final validation complete."
-
-      - name: Check if live URLs were found
+      - name: Check if JS URLs were found
         id: check_file
         run: |
-          if [ -s live_urls.txt ]; then
+          if [ -s discovered-js-urls.txt ]; then
             echo "found=true" >> $GITHUB_OUTPUT
-            echo "SUCCESS: Found $(wc -l < live_urls.txt) verified live URLs to process."
           else
             echo "found=false" >> $GITHUB_OUTPUT
-            echo "WARNING: No live URLs found after final validation. Stopping workflow."
+            echo "WARNING: No potential JS URLs found. Stopping workflow."
           fi
-      - name: Upload live URLs artifact
+          
+      - name: Upload Discovered JS URLs Artifact
         if: steps.check_file.outputs.found == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: live-urls-${{ github.run_id }}
-          path: live_urls.txt
+          name: discovered-js-urls
+          path: discovered-js-urls.txt
 
-
-
-
-
-  generate-matrix:
-    name: "2. Generate Parallel Matrix"
-    needs: discover-and-filter
-    if: needs.discover-and-filter.outputs.live_hosts_found == 'true'
+  # JAB 2: اعتبارسنجی، هش‌سازی و پیدا کردن فایل‌های جدید - این جاب می‌تواند سنگین باشد
+  validate-and-hash:
+    name: "2. Validate, Hash & Find New JS"
     runs-on: ubuntu-latest
+    needs: discover-passive-js
+    if: needs.discover-passive-js.outputs.js_urls_found == 'true'
     outputs:
-      matrix: ${{ steps.split.outputs.matrix }}
-    steps:
-      - name: Download live subdomains artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: live-subdomains-${{ github.run_id }}
-      - name: Split subdomains into chunks
-        id: split
-        run: |
-          mkdir -p chunks
-          split -d -l 25 live_subdomains.txt chunks/chunk_
-          # Creates a JSON array of chunk filenames, e.g., ["chunk_00", "chunk_01"]
-          MATRIX_JSON=$(ls -1q chunks/ | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          echo "matrix=${MATRIX_JSON}" >> $GITHUB_OUTPUT
-      - name: Upload subdomain chunks artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: subdomain-chunks-${{ github.run_id }}
-          path: chunks/
-
-  extract-js:
-    name: "3. Extract JS (Chunk ${{ matrix.chunk_file }})"
-    runs-on: ubuntu-latest
-    needs: generate-matrix
-    strategy:
-      fail-fast: false
-      matrix:
-        chunk_file: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-      - name: Download subdomain chunk
-        uses: actions/download-artifact@v4
-        with:
-          name: subdomain-chunks-${{ github.run_id }}
-          # FIX: Download the artifact *into* a 'chunks' directory
-          path: chunks
-      - name: Install Playwright and dependencies
-        run: |
-          npm install playwright
-          npx playwright install --with-deps chromium
-      - name: Run Playwright JS Extraction
-        run: |
-          CHUNK_FILE="chunks/${{ matrix.chunk_file }}"
-          echo "Processing chunk file: $CHUNK_FILE"
-          
-          if [ ! -s "$CHUNK_FILE" ]; then
-            echo "Chunk file is empty or does not exist. Skipping."
-            exit 0
-          fi
-          
-          while IFS= read -r host; do
-            if [ -n "$host" ]; then
-              echo "Crawling: $host"
-              node extract-js.js "$host"
-            fi
-          done < "$CHUNK_FILE"
-      - name: Upload Captured JS Files
-        uses: actions/upload-artifact@v4
-        with:
-          name: captured-js-${{ matrix.chunk_file }}-${{ github.run_id }}
-          path: captured_js/
-          if-no-files-found: ignore
-
-
-  consolidate-and-commit:
-    name: "4. Consolidate, Deduplicate & Commit"
-    needs: extract-js
-    if: always() # Run this job even if some extraction jobs fail
-    runs-on: ubuntu-latest
+      new_files_found: ${{ steps.find_new.outputs.found }}
     steps:
       - name: Checkout Full Git History
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Download all JS artifacts
+      
+      - name: Download discovered JS URLs
         uses: actions/download-artifact@v4
         with:
-          path: all_js_artifacts/
-          # FIX: The pattern now correctly matches the uploaded artifact names
-          pattern: captured-js-*-${{ github.run_id }}
-          if-no-files-found: warn
+          name: discovered-js-urls
+          
+      - name: Install Httpx
+        run: |
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
-      - name: Consolidate, Deduplicate, Filter, and Prepare Commit
-        id: process_files
+      - name: Validate JS URLs are live
+        id: validate
+        run: |
+          echo "INFO: Validating $(wc -l < discovered-js-urls.txt) URLs..."
+          # Only keep URLs that return 200 OK and have a javascript content-type
+          httpx -list discovered-js-urls.txt -silent -mc 200 -ct -match-string "javascript" -o live-js-urls.txt
+          echo "INFO: Found $(wc -l < live-js-urls.txt) live and valid JS files."
+      
+      - name: Generate Hashes for Live JS Files
+        id: generate_hashes
+        run: |
+          # This script will download each URL, calculate its SHA256 hash, and output a 'url,hash' CSV
+          # We create the script on the fly to avoid repo clutter.
+          cat << 'EOF' > generate_hashes.sh
+          #!/bin/bash
+          # Use aria2c for fast, parallel downloads
+          aria2c -i "$1" -j 20 --dir=./downloads --continue=true --auto-file-renaming=false
+          
+          # Process downloaded files
+          while IFS= read -r url; do
+            filename=$(basename "$url")
+            filepath="./downloads/$filename"
+            if [ -f "$filepath" ]; then
+              hash=$(sha256sum "$filepath" | awk '{print $1}')
+              echo "$url,$hash"
+            fi
+          done < "$1" > current_hashes.csv
+          EOF
+          
+          chmod +x generate_hashes.sh
+          ./generate_hashes.sh live-js-urls.txt
+
+      - name: Find New JS Files by Comparing Hashes
+        id: find_new
         run: |
           TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
           mkdir -p "$TARGET_DIR"
-          MASTER_INDEX_FILE="$TARGET_DIR/index.csv"
-          touch "$MASTER_INDEX_FILE"
+          KNOWN_HASHES_FILE="$TARGET_DIR/known_hashes.csv"
+          touch "$KNOWN_HASHES_FILE"
           
-          NEW_FILES_SUMMARY="new_files_summary.log"
+          # Compare current hashes with known hashes to find new ones
+          # `grep -F -v -f file1 file2` finds lines in file2 that are NOT in file1
+          # We extract just the known hashes for comparison
+          cut -d, -f2 "$KNOWN_HASHES_FILE" > known_hashes_only.txt
+          grep -F -v -f known_hashes_only.txt current_hashes.csv > new_files.csv
           
-          # Check if any artifacts were downloaded
-          if [ ! -d "all_js_artifacts" ] || [ -z "$(ls -A all_js_artifacts)" ]; then
-            echo "No JS files were captured in this run."
-            echo "changes_detected=false" >> $GITHUB_OUTPUT
-            exit 0
+          if [ -s new_files.csv ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "SUCCESS: Found $(wc -l < new_files.csv) new JS files."
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "INFO: No new JS files detected in this run."
           fi
 
-          # NEW: Define common library signatures. This list can be expanded.
-          PATTERNS="/*! jQuery|jQuery Foundation|React v|@license|Licensed under MIT|Bootstrap v|Angular v|webpackBootstrap|Moment.js|lodash|core-js|modernizr"
+      - name: Upload New JS Files Info
+        if: steps.find_new.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: new-js-files
+          path: new_files.csv
 
-          find all_js_artifacts -type f -name "*.js" | while read -r js_file; do
-            HASH=$(basename "$js_file" .js)
-            
-            # Check if this hash is already known
-            if ! grep -q "^$HASH," "$MASTER_INDEX_FILE"; then
-              
-              # --- NEW: Content-based library filtering ---
-              # Before processing, check the first 20 lines for library signatures.
-              if head -n 20 "$js_file" | grep -qiE "$PATTERNS"; then
-                echo "  -> Ignoring new library file: Hash $HASH"
-              else
-                # This is a new, non-library file. Process it.
-                INDEX_FILE=$(dirname "$js_file")/index.txt # Corrected from index.csv to index.txt
-                URL=$(grep "^$HASH," "$INDEX_FILE" | cut -d, -f2-)
-                
-                if [[ -n "$URL" ]]; then
-                  echo "New custom file found: Hash $HASH from URL $URL"
-                  cp "$js_file" "$TARGET_DIR/$HASH.js"
-                  echo "$HASH,$URL,$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$MASTER_INDEX_FILE"
-                  echo "✅ New Custom JS: $URL" >> $NEW_FILES_SUMMARY
-                fi
-              fi
-            fi
-          done
+  # JAB 3: تحلیل، کامیت و اطلاع‌رسانی - فقط برای فایل‌های جدید
+  analyze-and-commit:
+    name: "3. Analyze, Commit & Notify"
+    runs-on: ubuntu-latest
+    needs: validate-and-hash
+    if: needs.validate-and-hash.outputs.new_files_found == 'true'
+    steps:
+      - name: Checkout Full Git History
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
           
-          if [ ! -s "$NEW_FILES_SUMMARY" ]; then
-            echo "No new custom JS files detected."
-            echo "changes_detected=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+      - name: Download New JS Files Info
+        uses: actions/download-artifact@v4
+        with:
+          name: new-js-files
+
+      - name: Update Known Hashes and Prepare Summary
+        id: process_commit
+        run: |
+          TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
+          KNOWN_HASHES_FILE="$TARGET_DIR/known_hashes.csv"
           
-          echo "changes_detected=true" >> $GITHUB_OUTPUT
+          # Append new files to the master list
+          cat new_files.csv >> "$KNOWN_HASHES_FILE"
+          
+          # Create a summary for notification
+          SUMMARY_CONTENT=$(awk -F, '{print "✅ " $1}' new_files.csv)
           echo "summary<<EOF" >> $GITHUB_OUTPUT
-          cat $NEW_FILES_SUMMARY >> $GITHUB_OUTPUT
+          echo -e "$SUMMARY_CONTENT" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-
       - name: Commit Changes
-        if: steps.process_files.outputs.changes_detected == 'true'
         run: |
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action-bot@github.com"
-          
           TARGET_DIR="js_files/${{ vars.TARGET_DOMAIN }}"
-          # FIX: Corrected the path for the sort command
-          sort -u -o "$TARGET_DIR/index.csv" "$TARGET_DIR/index.csv"
-          
-          git add "js_files/"
-          git commit -m "JS Scan: Update files for ${{ vars.TARGET_DOMAIN }}"
-          # Adding retry logic for push, just in case
+          sort -u -o "$TARGET_DIR/known_hashes.csv" "$TARGET_DIR/known_hashes.csv"
+          git add "$TARGET_DIR/known_hashes.csv"
+          git commit -m "JS Scan: Discovered new files for ${{ vars.TARGET_DOMAIN }}"
           git pull origin main --rebase && git push --atomic origin main
-          
+
       - name: Send Notification on Change
-        if: steps.process_files.outputs.changes_detected == 'true'
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          SUMMARY_CONTENT: ${{ steps.process_files.outputs.summary }}
+          SUMMARY_CONTENT: ${{ steps.process_commit.outputs.summary }}
         run: |
           if [ -n "$DISCORD_WEBHOOK_URL" ]; then
             curl -X POST -H "Content-Type: application/json" \
-            -d "{\"content\": \"🔎 **New JavaScript Files Detected for `${{ vars.TARGET_DOMAIN }}`**\n\`\`\`\n${SUMMARY_CONTENT}\n\`\`\`\"}" \
+            -d "{\"content\": \"🔎 **New JavaScript URLs Detected for `${{ vars.TARGET_DOMAIN }}`**\n\`\`\`\n${SUMMARY_CONTENT}\n\`\`\`\"}" \
             "$DISCORD_WEBHOOK_URL"
-          else
-            echo "Discord webhook URL not set. Skipping notification."
           fi
